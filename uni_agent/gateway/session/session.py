@@ -712,13 +712,16 @@ class GatewaySession:
                 prompt_length = len(buffer.prompt_ids)
                 if merged_token_ids[:prompt_length] != buffer.prompt_ids:
                     raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
+                retained_end = min(len(buffer.response_mask), len(merged_response_mask))
+                for index, (before, after) in enumerate(zip(buffer.response_mask, merged_response_mask)):
+                    if before and not after:
+                        retained_end = index
+                        break
                 buffer.response_ids = list(merged_token_ids[prompt_length:])
                 buffer.response_mask = list(merged_response_mask)
                 buffer.response_logprobs = list(merged_response_logprobs or [])
                 buffer.generation_spans = [
-                    (start, min(end, len(buffer.response_ids)))
-                    for start, end in buffer.generation_spans
-                    if start <= len(buffer.response_ids)
+                    (start, min(end, retained_end)) for start, end in buffer.generation_spans if start <= retained_end
                 ]
                 self._assert_response_logprob_alignment(buffer)
                 if appended_images:

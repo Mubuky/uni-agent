@@ -319,3 +319,25 @@ async def test_parser_payload_errors_become_feedback_but_api_errors_propagate():
     parser.parse_non_stream = fail_api
     with pytest.raises(RuntimeError, match="sglang tool parser"):
         await codec.decode_response(list(map(ord, text)), tools=tools)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_cls", [GatewaySession, TreeGatewaySession])
+async def test_context_boundary_trim_does_not_mark_replacement_context_as_generation(session_cls):
+    from tests.uni_agent.gateway.test_session_trajectory_tree_on_cpu import FakeContinuousCodec
+
+    codec = MessageCodec(FakeTokenizer())
+    codec._continuous_token_builder = FakeContinuousCodec(trim_boundary=True)
+    session = session_cls(SessionHandle("trim"), codec, sampling_params={"logprobs": True})
+    backend = Backend("AB", "C", "D")
+    messages = [{"role": "user", "content": "work"}]
+    for answer in ["AB", "C", "D"]:
+        await session.run_generation(request(messages), backend)
+        messages += [{"role": "assistant", "content": answer}, {"role": "user", "content": "continue"}]
+    [trajectory] = await session.finalize()
+    generated = [0] * len(trajectory.response_ids)
+    for start, end in trajectory.generation_spans:
+        generated[start:end] = [1] * (end - start)
+    assert generated == trajectory.response_mask
+    assert [token for token, mask in zip(trajectory.response_ids, generated) if mask] == [ord("A"), ord("D")]
+    assert [lp for lp, mask in zip(trajectory.response_logprobs, generated) if mask] == [-0.25, -0.25]
