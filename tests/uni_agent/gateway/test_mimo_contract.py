@@ -254,25 +254,30 @@ async def test_http_responses_and_activity_routes_use_native_session(tree):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_cls", [GatewaySession, TreeGatewaySession])
-async def test_empty_generation_retains_turn_alignment(session_cls):
+@pytest.mark.parametrize("keep_empty_assistant", [False, True])
+async def test_empty_generation_retains_turn_alignment(session_cls, keep_empty_assistant):
     session = session_cls(
         SessionHandle("empty-turn"), MessageCodec(FakeTokenizer()), sampling_params={"logprobs": True}
     )
     backend = Backend("", "next")
     initial = [{"role": "user", "content": "work"}]
     await session.run_generation(request(initial), backend)
-    await session.run_generation(
-        request(initial + [{"role": "assistant", "content": ""}, {"role": "user", "content": "continue"}]), backend
-    )
+    messages = initial + [{"role": "assistant", "content": ""}, {"role": "user", "content": "continue"}]
+    followup = request(messages)
+    if keep_empty_assistant:
+        followup["messages"] = messages
+    await session.run_generation(followup, backend)
     trajectories = await session.finalize()
     assert len(trajectories) == 1
-    assert len(trajectories[0].generation_spans) == 2
-    assert trajectories[0].generation_spans[0] == (0, 0)
+    # Responses lowering drops empty assistant items; native rollback then replaces that turn.
+    assert len(trajectories[0].generation_spans) == (2 if keep_empty_assistant else 1)
+    if keep_empty_assistant:
+        assert trajectories[0].generation_spans[0] == (0, 0)
     framework = GatewayAgentFramework(None, runner_registry={}, ship_turn_index=True)
     field, _ = framework._trajectory_to_tq_field_and_tag(
         trajectory=trajectories[0], sample_fields={}, session_index=0, global_steps=1, uid="empty"
     )
-    assert (field["turn_index"][field["response_mask"] == 1] == 1).all()
+    assert (field["turn_index"][field["response_mask"] == 1] == int(keep_empty_assistant)).all()
 
 
 @pytest.mark.asyncio

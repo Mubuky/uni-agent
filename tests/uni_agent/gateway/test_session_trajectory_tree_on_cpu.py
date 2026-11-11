@@ -30,6 +30,12 @@ class FakeContinuousCodec:
         self.initial_calls = 0
         self.context_calls = 0
 
+    def model_messages_for(self, messages, tools=None):
+        return messages
+
+    def model_tools_for(self, tools):
+        return tools
+
     async def extract_multi_modal_data(self, messages):
         return None, None
 

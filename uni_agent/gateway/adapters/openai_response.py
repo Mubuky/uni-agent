@@ -19,7 +19,7 @@ from uuid import uuid4
 from fastapi.responses import StreamingResponse
 
 from uni_agent.gateway.session.session import GenerationOutcome
-from uni_agent.gateway.session.types import InternalGenerationRequest
+from uni_agent.gateway.session.types import InternalGenerationRequest, UnsupportedMediaError
 
 from .openai_chat import openai_to_internal
 from .types import MalformedRequestError
@@ -772,7 +772,11 @@ def responses_stream_response(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                status_code = getattr(exc, "status_code", 500)
+                status_code = (
+                    400
+                    if isinstance(exc, (MalformedRequestError, UnsupportedMediaError))
+                    else getattr(exc, "status_code", 500)
+                )
                 code = "invalid_request_error" if 400 <= status_code < 500 else "internal_error"
                 message = str(getattr(exc, "detail", str(exc)))
                 failed = {**in_progress, "status": "failed", "error": {"code": code, "message": message}}
