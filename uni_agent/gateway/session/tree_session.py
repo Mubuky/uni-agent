@@ -901,7 +901,10 @@ class TreeGatewaySession(GatewaySession):
         if leaf.rollback_count:
             extra_fields["rollback_count"] = leaf.rollback_count
             extra_fields["rollback_dropped_trainable_tokens_total"] = leaf.rollback_dropped_trainable_tokens_total
+        tools = self._copy_tools(self.tool_schemas_by_fingerprint.get(leaf.tools_fingerprint))
         return Trajectory(
+            model_messages=self._codec.model_messages_for(self._path_messages(path), tools),
+            model_tools=self._codec.model_tools_for(tools),
             generation_spans=generation_spans,
             messages=self._path_messages(path),
             tools=self._copy_tools(self.tool_schemas_by_fingerprint.get(leaf.tools_fingerprint)),

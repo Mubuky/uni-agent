@@ -1210,6 +1210,8 @@ class GatewayAgentFramework(AgentFramework):
                         "trajectories": [
                             {
                                 "messages": t.messages,
+                                "model_messages": t.model_messages,
+                                "model_tools": t.model_tools,
                                 "tools": t.tools,
                                 "runner_reward_info": t.extra_fields.get("runner_reward_info"),
                                 "reward_score": t.reward_score,
@@ -1403,8 +1405,10 @@ class GatewayAgentFramework(AgentFramework):
         field["loss_mask"] = response_mask
         field["tool_call_error_mask"], error_alignment, _ = _tool_call_error_mask(trajectory)
         field["repetition_mask"], repetition_alignment, _ = _repetition_mask(trajectory)
-        field["extra_fields"]["tool_call_error_alignment"] = error_alignment
-        field["extra_fields"]["repetition_alignment"] = repetition_alignment
+        if error_alignment != "missing_flags":
+            field["extra_fields"]["tool_call_error_alignment"] = error_alignment
+        if repetition_alignment != "not_detected":
+            field["extra_fields"]["repetition_alignment"] = repetition_alignment
         if self._ship_turn_index:
             field["turn_index"], alignment = _turn_index(trajectory)
             field["extra_fields"]["turn_index_alignment"] = alignment

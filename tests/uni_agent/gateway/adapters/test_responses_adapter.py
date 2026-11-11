@@ -81,6 +81,7 @@ def test_custom_exec_round_trips_raw_input_and_tool_output():
 
     assert internal["tools"] == [
         {
+            "custom": payload["tools"][0],
             "type": "function",
             "function": {
                 "name": "exec",

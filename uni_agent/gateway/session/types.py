@@ -93,6 +93,8 @@ class Trajectory:
     response_mask: list[int]
     generation_spans: list[tuple[int, int]] = field(default_factory=list)
     messages: list[dict[str, Any]] | None = None
+    model_messages: list[dict[str, Any]] | None = None
+    model_tools: list[dict[str, Any]] | None = None
     tools: list[dict[str, Any]] | None = None
     response_logprobs: list[float] | None = None
     finished: bool | None = None

@@ -385,7 +385,7 @@ class MessageCodec:
 
     def model_messages_for(self, messages, tools):
         custom_names = {_tool_name(tool) for tool in tools or [] if "custom" in tool}
-        if not self._freeform_tool_calls or not custom_names:
+        if not custom_names or not self._freeform_tool_calls:
             return messages
         result = []
         for message in messages:

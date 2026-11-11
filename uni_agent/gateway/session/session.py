@@ -1091,6 +1091,8 @@ class GatewaySession:
         return Trajectory(
             generation_spans=list(chain.buffer.generation_spans),
             messages=list(chain.message_history),
+            model_messages=self._codec.model_messages_for(chain.message_history, chain.active_tool_schemas),
+            model_tools=self._codec.model_tools_for(chain.active_tool_schemas),
             tools=chain.active_tool_schemas,
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),

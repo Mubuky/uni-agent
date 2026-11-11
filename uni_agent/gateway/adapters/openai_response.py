@@ -8,10 +8,11 @@ state.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -713,15 +714,32 @@ def _event_to_sse(event: dict[str, Any]) -> bytes:
 
 
 def responses_stream_response(
-    outcome: GenerationOutcome,
+    outcome: GenerationOutcome | Callable[[], Awaitable[GenerationOutcome]],
     *,
     payload: dict[str, Any] | None = None,
     model: str,
+    heartbeat_interval_s: float = 15.0,
 ) -> StreamingResponse:
-    """Serialize a completed generation outcome as Responses SSE events."""
-    response = responses_build_response(outcome, payload=payload, model=model)
+    """Stream Responses events while retaining activity during backend generation."""
+    if heartbeat_interval_s <= 0:
+        raise ValueError("heartbeat_interval_s must be positive")
+    generation = outcome if callable(outcome) else None
+    response = (
+        _response_base(
+            dict(payload or {}),
+            response_id=f"resp_{uuid4().hex}",
+            model=model,
+            created_at=int(time.time()),
+            status="in_progress",
+            output=[],
+            usage=None,
+        )
+        if generation
+        else responses_build_response(outcome, payload=payload, model=model)
+    )
 
     async def _gen() -> AsyncIterator[bytes]:
+        nonlocal response
         sequence_number = 0
 
         def event(event_type: str, **fields: Any) -> dict[str, Any]:
@@ -740,6 +758,28 @@ def responses_stream_response(
         }
         yield _event_to_sse(event("response.created", response=in_progress))
         yield _event_to_sse(event("response.in_progress", response=in_progress))
+        if generation is not None:
+            task = asyncio.ensure_future(generation())
+            try:
+                while not task.done():
+                    done, _ = await asyncio.wait({task}, timeout=heartbeat_interval_s)
+                    if not done:
+                        yield _event_to_sse(event("response.in_progress", response=in_progress))
+                response = responses_build_response(
+                    task.result(), payload=payload, model=model, response_id=response["id"]
+                )
+                response["created_at"] = in_progress["created_at"]
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failed = {**in_progress, "status": "failed", "error": {"code": "internal_error", "message": str(exc)}}
+                yield _event_to_sse(event("response.failed", response=failed))
+                yield _event_to_sse(event("error", code="internal_error", message=str(exc), param=None))
+                return
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         for output_index, item in enumerate(response["output"]):
             item_type = item["type"]
             if item_type == "reasoning":

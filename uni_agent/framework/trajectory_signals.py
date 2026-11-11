@@ -70,7 +70,7 @@ def _rolling_ngram_hashes(token_ids: np.ndarray, ngram_size: int) -> np.ndarray:
         inv_powers = np.concatenate([np.ones(1, dtype=np.uint64), inv_powers[:-1]])  # B**(-j)
         prefix = np.concatenate([np.zeros(1, dtype=np.uint64), np.cumsum(tokens * inv_powers, dtype=np.uint64)])
         powers = np.cumprod(np.full(tokens.shape[0], _REPETITION_HASH_BASE, dtype=np.uint64))  # B**(i+1)
-        scale = powers[n - 2 : n - 2 + count] if n >= 2 else np.ones(count, dtype=np.uint64)
+        scale = powers[n - 2 : n - 2 + count] if n >= 2 else np.concatenate([np.ones(1, dtype=np.uint64), powers[:-1]])
         return (prefix[n : n + count] - prefix[:count]) * scale
 
 

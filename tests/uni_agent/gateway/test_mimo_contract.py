@@ -29,7 +29,11 @@ class Backend:
 
 
 def request(items, tools=None):
-    return responses_to_internal({"input": items, "tools": tools or []}, base_sampling_params={"logprobs": True})
+    return responses_to_internal(
+        {"input": items, "tools": tools or []},
+        base_sampling_params={"logprobs": True},
+        allowed_sampling_keys=frozenset(),
+    )
 
 
 @pytest.mark.asyncio
@@ -146,3 +150,42 @@ async def test_idle_wait_returns_typed_result_and_ignores_grading():
     finally:
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stream_sends_progress_before_generation_and_cancels_on_disconnect():
+    import json
+
+    from uni_agent.gateway.adapters.openai_response import responses_stream_response
+
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def generate():
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    response = responses_stream_response(generate, model="fixture", heartbeat_interval_s=0.001)
+    stream = response.body_iterator
+    created = json.loads((await anext(stream)).decode().split("data: ")[1])
+    assert created["type"] == "response.created" and not started.is_set()
+    await anext(stream)
+    heartbeat = json.loads((await anext(stream)).decode().split("data: ")[1])
+    assert heartbeat["type"] == "response.in_progress" and started.is_set()
+    await stream.aclose()
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_is_reported_without_a_completed_event():
+    from uni_agent.gateway.adapters.openai_response import responses_stream_response
+
+    async def generate():
+        raise ValueError("backend failure")
+
+    response = responses_stream_response(generate, model="fixture")
+    wire = b"".join([chunk async for chunk in response.body_iterator])
+    assert b"event: response.failed" in wire and b"event: error" in wire
+    assert b"event: response.completed" not in wire

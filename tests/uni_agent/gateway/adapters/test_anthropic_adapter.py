@@ -458,9 +458,8 @@ def test_tool_input_schema_anyof_preserves_heterogeneous_branches_without_inferr
 
 @pytest.mark.cpu
 @pytest.mark.level0
-def test_thinking_block_dropped_with_warning(caplog):
-    """Inbound Anthropic thinking blocks are dropped with a warning while
-    neighboring assistant text remains in the prompt history."""
+def test_thinking_block_preserved_in_history(caplog):
+    """Retain reasoning and visible assistant text as separate history fields."""
     with caplog.at_level("WARNING", logger="gateway"):
         req = anthropic_to_internal(
             {
@@ -476,7 +475,8 @@ def test_thinking_block_dropped_with_warning(caplog):
             **BASE,
         )
     assert req["messages"][-1]["content"] == "done"
-    assert any("thinking" in r.message for r in caplog.records)
+    assert req["messages"][-1]["reasoning_content"] == "reasoning..."
+    assert not caplog.records
 
 
 @pytest.mark.cpu

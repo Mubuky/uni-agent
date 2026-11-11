@@ -1840,7 +1840,7 @@ async def test_multiple_chains_prefix_content_change_does_not_reuse_chain_and_ha
 @pytest.mark.cpu
 @pytest.mark.level0
 def test_message_prefix_hashes_use_canonical_internal_tool_call_arguments():
-    """Hash canonical dict arguments by value without reparsing wire strings."""
+    """Raw generated JSON and its replayed canonical object share a prefix."""
     session = _session("hash-tool-arguments")
 
     def assistant_tool_call(arguments) -> dict:
@@ -1863,7 +1863,7 @@ def test_message_prefix_hashes_use_canonical_internal_tool_call_arguments():
     )
 
     assert canonical_a == canonical_b
-    assert canonical_a != unnormalized_wire
+    assert canonical_a == unnormalized_wire
 
 
 @pytest.mark.cpu

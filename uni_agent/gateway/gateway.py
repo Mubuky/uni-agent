@@ -319,11 +319,15 @@ class _GatewayActor:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if agent_context is not None:
             internal["agent_context"] = agent_context
-        outcome = await session.run_generation(internal, self._policy_clients[policy_name])
         model = str(payload.get("model") or "unknown")
         try:
             if payload.get("stream") is True:
-                return responses_stream_response(outcome, payload=payload, model=model)
+                return responses_stream_response(
+                    lambda: session.run_generation(internal, self._policy_clients[policy_name]),
+                    payload=payload,
+                    model=model,
+                )
+            outcome = await session.run_generation(internal, self._policy_clients[policy_name])
             response = responses_build_response(outcome, payload=payload, model=model)
         except MalformedRequestError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
