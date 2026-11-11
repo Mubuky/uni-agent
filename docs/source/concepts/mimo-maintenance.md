@@ -112,11 +112,11 @@ rollback, coalescing, media, tree branches and framework admission.
 
 ## Compatibility and validation
 
-The reviewed combination is Uni-Agent code `60f4438`, companion verl
+The reviewed combination is Uni-Agent code `130b368ceeb667d16f332b83f1a360d6220cbb17`, companion verl
 `d799866371163b0762302f2a7e5a1f09e15ee9d8`, and unchanged
 `XiaomiMiMo/mimoagent@c3df8469f250b15e7906487a6d52be4c1827a509`.
-Commit `710a0bf` pins that companion verl in this repository. Its `uni_agent`
-source tree is identical to the tested code (`fb29bc7c978f134070265c38c796d26e717c95df`).
+The repository gitlink pins that companion verl. The initial live trials used
+Uni-Agent code `60f4438`, before the tool-free compaction request fix.
 
 The [verl maintenance branch](https://github.com/Mubuky/verl/tree/mimo-maint)
 uses the current Continuous Token API and returns native `TaskResult` from its
@@ -134,11 +134,11 @@ by remote wheel availability; that runtime combination remains unverified.
 
 | Scope | Result |
 | --- | --- |
-| Gateway/framework, including native HTTP/SSE, Responses, codec, linear/tree contexts and real Ray gateway actors | 717 passed, 9 skipped, 17 deselected |
+| Gateway/framework, including native HTTP/SSE, Responses, codec, linear/tree contexts and real Ray gateway actors | 739 passed, 9 skipped, 17 deselected |
 | Native verl multi-trajectory GRPO, loss aggregation, Token-TIS, padding and ReplayBuffer with a real TransferQueue 0.1.11 service | 95 passed |
 | MiMo runner, consumer routing, token contract, native-result monitoring and optimizer membership | 36 passed, 1 skipped |
 | Isolated Codex/model rollout with default compaction threshold and four-GPU optimizer update | Passed: 16 consumed rollouts, nonzero gradient and saved parameter change |
-| Forced native Codex compaction | Blocked by upstream Responses rejection of an empty-tool request |
+| Forced native Codex compaction | Passed: 15 compacted rollouts, 571 consumed chains, 5 zero-mask padding rows and 36 optimizer updates |
 
 The nine gateway skips require optional `qwen_vl_utils` or `vllm.parser.qwen3`.
 The 17 deselected level1 checks exercise provider tunnels or live worker-ready
@@ -146,14 +146,20 @@ probes. The consumer skip requires an explicitly configured Docker test image.
 A live SGLang deployment is outside this validation scope.
 
 The forced-compaction Codex 0.154.0 trial reached model generation, then failed when native
-compaction sent `tools=[]` with `parallel_tool_calls=false`. The current upstream
-adapter rejects that flag before generation. A minimal empty-tool request
+compaction sent `tools=[]` with `parallel_tool_calls=false`. The selected upstream base
+rejects that flag before generation. A minimal empty-tool request
 reproduces the rejection; the earlier MiMo adapter accepted it. Codex constructs
 its [compaction prompt](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/compact.rs#L271)
 using [Prompt defaults](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/client_common.rs#L37),
-so this is not a mimoagent result-contract issue. The branch currently retains
-upstream's validation. Live compaction and optimizer consumption of compacted multi-chain trajectories
-remain switching requirements.
+so this is not a mimoagent result-contract issue. The adapter now accepts the
+flag when no callable tools remain after resolving top-level declarations,
+`additional_tools`, deferred tools and `tool_choice="none"`. Requests with callable
+tools retain the native restriction. Boolean and tool-list validation remain
+strict, including empty non-list values. JSON and SSE regressions retain past
+tool calls while generating a tool-free summary; native linear/tree tests check
+its token provenance. No client-version branch or new interface is needed.
+A subsequent live trial verified compaction and optimizer consumption of all
+compacted chains, as detailed below.
 
 A separate trial using Codex's default compaction threshold completed one native
 optimizer step on four H200 GPUs. It consumed two groups of eight rollouts with
@@ -169,6 +175,36 @@ mean weight `0.98054516` with effective sample size `0.99796887`. The optimizer
 consumed 16 of those sessions; three unfinished prefetched sessions remained
 ungraded. All captured completed sessions had one context chain. The test job,
 GPU allocation and sandbox containers were released after artifact collection.
+
+The subsequent forced-compaction trial used the reviewed code with a 262,144-token
+window and a 32,768-token native auto-compaction threshold. All 15 consumed
+rollouts were linked by native Codex thread IDs to actual compaction events.
+Their 571 context chains reached the optimizer with five native zero-mask padding
+rows. The two reward groups contained seven and eight rollouts, with four and one
+positive outcomes. Native GRPO advantages matched the rollout-based calculation:
+minimum `-4/7`, maximum `7/8`, and generated-token-weighted mean `-0.01095301`.
+
+One global training step performed 36 native Adam mini-batch updates; all 760
+rank-zero parameter state counters confirmed 36. Gradient norm was `0.73928570`;
+819,387,878 BF16 weight elements changed, with L2 delta `0.30025881`. All 29
+graded sessions passed token/span/mask/logprob audits: 897 chains, 2,789,697
+generated tokens and 7,978,373 context tokens. Thirty native Codex archives
+recorded 442 compactions. Probability correlation was `0.99883491`; Token-TIS
+mean weight was `0.97548366` with effective sample size `0.99707247`.
+
+One model repetition/output-length failure remained ungraded and was excluded
+from training. Two unfinished prefetched executions were archived separately.
+The job, GPU allocation and remaining sandbox containers were released.
+Generation took 3,879.44 seconds and actor updates took 1,976.96 seconds. The
+17,874,671 training input tokens include carried prompt/context tokens. Native
+mini-batches operate on expanded chain rows, so compaction frequency changes
+both training work and optimizer update count. The consumer keeps Codex's native
+default threshold; the lower threshold belongs only to this frozen stress trial.
+
+The frozen combination has passed the compatibility requirements for switching.
+Newer runtime versions, production-scale throughput and learning benefit remain
+outside this validation. Model repetition and long-tail generation remain recipe
+observations, without a new framework API or client-version patch.
 
 The uneven-context regression gives one successful rollout three contexts and
 seven unsuccessful rollouts one context each. Native GRPO assigns `0.875` to
