@@ -339,5 +339,8 @@ async def test_context_boundary_trim_does_not_mark_replacement_context_as_genera
     for start, end in trajectory.generation_spans:
         generated[start:end] = [1] * (end - start)
     assert generated == trajectory.response_mask
-    assert [token for token, mask in zip(trajectory.response_ids, generated) if mask] == [ord("A"), ord("D")]
-    assert [lp for lp, mask in zip(trajectory.response_logprobs, generated) if mask] == [-0.25, -0.25]
+    assert [token for token, mask in zip(trajectory.response_ids, generated, strict=True) if mask] == [
+        ord("A"),
+        ord("D"),
+    ]
+    assert [lp for lp, mask in zip(trajectory.response_logprobs, generated, strict=True) if mask] == [-0.25, -0.25]

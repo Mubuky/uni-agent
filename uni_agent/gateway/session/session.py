@@ -713,7 +713,7 @@ class GatewaySession:
                 if merged_token_ids[:prompt_length] != buffer.prompt_ids:
                     raise RuntimeError("Continuous Token merge modified the immutable trajectory prompt")
                 retained_end = min(len(buffer.response_mask), len(merged_response_mask))
-                for index, (before, after) in enumerate(zip(buffer.response_mask, merged_response_mask)):
+                for index, (before, after) in enumerate(zip(buffer.response_mask, merged_response_mask, strict=False)):
                     if before and not after:
                         retained_end = index
                         break
