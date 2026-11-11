@@ -679,3 +679,154 @@ async def test_anthropic_stream_response_emits_tool_use_delta():
     assert delta["delta"]["type"] == "input_json_delta"
     assert json.loads(delta["delta"]["partial_json"]) == {"a": 1}
     assert message_delta["delta"]["stop_reason"] == "tool_use"
+
+
+def test_thinking_block_round_trips_to_reasoning_content():
+    """Inbound Anthropic thinking blocks (replayed by the client from our own
+    response) become ``reasoning_content`` so the chat template renders the
+    real reasoning for history turns instead of an empty think block."""
+    req = anthropic_to_internal(
+        {
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "reasoning...", "signature": ""},
+                        {"type": "text", "text": "done"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"a": 1}},
+                    ],
+                },
+            ],
+            "max_tokens": 8,
+        },
+        **BASE,
+    )
+    assistant = req["messages"][-1]
+    assert assistant["content"] == "done"
+    assert assistant["reasoning_content"] == "reasoning..."
+    assert assistant["tool_calls"][0]["function"] == {"name": "f", "arguments": {"a": 1}}
+
+
+def test_empty_or_missing_thinking_leaves_reasoning_content_unset():
+    """An empty thinking block or no thinking block at all must not create a
+    ``reasoning_content`` key, so the template's empty-think rendering is only
+    reached when the model really produced no reasoning."""
+    req = anthropic_to_internal(
+        {
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "done"}],
+                },
+                {"role": "user", "content": "more"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            ],
+            "max_tokens": 8,
+        },
+        **BASE,
+    )
+    assert "reasoning_content" not in req["messages"][1]
+    assert "reasoning_content" not in req["messages"][3]
+
+    with pytest.raises(MalformedRequestError):
+        anthropic_to_internal(
+            {
+                "messages": [
+                    {"role": "user", "content": "go"},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": {"bad": 1}}]},
+                ],
+                "max_tokens": 8,
+            },
+            **BASE,
+        )
+
+
+def test_anthropic_build_response_emits_thinking_block_first():
+    """Codec-split reasoning is returned as a leading Anthropic thinking block
+    ahead of text and tool_use so the client stores it in history."""
+    from uni_agent.gateway.adapters.anthropic import anthropic_build_response
+    from uni_agent.gateway.session.session import GenerationOutcome
+
+    body = anthropic_build_response(
+        GenerationOutcome(
+            assistant_msg={
+                "role": "assistant",
+                "reasoning_content": "let me think",
+                "content": "hi",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": {"a": 1}}}],
+            },
+            finish_reason="tool_calls",
+            prompt_tokens=3,
+            completion_tokens=1,
+        ),
+        model="claude-x",
+    )
+    assert body["content"] == [
+        {"type": "thinking", "thinking": "let me think", "signature": ""},
+        {"type": "text", "text": "hi"},
+        {"type": "tool_use", "id": "c1", "name": "f", "input": {"a": 1}},
+    ]
+
+    reasoning_only = anthropic_build_response(
+        GenerationOutcome(
+            assistant_msg={"role": "assistant", "reasoning_content": "only thoughts", "content": ""},
+            finish_reason="stop",
+            prompt_tokens=3,
+            completion_tokens=1,
+        ),
+        model="claude-x",
+    )
+    assert reasoning_only["content"] == [
+        {"type": "thinking", "thinking": "only thoughts", "signature": ""},
+        {"type": "text", "text": ""},
+    ]
+
+    no_reasoning = anthropic_build_response(
+        GenerationOutcome(
+            assistant_msg={"role": "assistant", "content": "hi"},
+            finish_reason="stop",
+            prompt_tokens=3,
+            completion_tokens=1,
+        ),
+        model="claude-x",
+    )
+    assert no_reasoning["content"] == [{"type": "text", "text": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_response_emits_thinking_block():
+    """Reasoning streams as an Anthropic thinking content block: thinking_delta
+    then signature_delta, indexed before the text block."""
+    from uni_agent.gateway.adapters.anthropic import anthropic_stream_response
+    from uni_agent.gateway.session.session import GenerationOutcome
+
+    resp = anthropic_stream_response(
+        GenerationOutcome(
+            assistant_msg={"role": "assistant", "reasoning_content": "let me think", "content": "hi"},
+            finish_reason="stop",
+            prompt_tokens=2,
+            completion_tokens=4,
+        ),
+        model="claude-x",
+    )
+
+    text = (b"".join([c async for c in resp.body_iterator])).decode()
+    events = []
+    for block in text.strip().split("\n\n"):
+        lines = block.splitlines()
+        events.append((lines[0].removeprefix("event: "), json.loads(lines[1].removeprefix("data: "))))
+
+    starts = [data for event, data in events if event == "content_block_start"]
+    deltas = [data for event, data in events if event == "content_block_delta"]
+    assert starts[0]["index"] == 0
+    assert starts[0]["content_block"] == {"type": "thinking", "thinking": "", "signature": ""}
+    assert starts[1]["content_block"] == {"type": "text", "text": ""}
+    assert [d["delta"] for d in deltas if d["index"] == 0] == [
+        {"type": "thinking_delta", "thinking": "let me think"},
+        {"type": "signature_delta", "signature": ""},
+    ]
+    assert [d["delta"] for d in deltas if d["index"] == 1] == [{"type": "text_delta", "text": "hi"}]
+    stops = [data["index"] for event, data in events if event == "content_block_stop"]
+    assert stops == [0, 1]

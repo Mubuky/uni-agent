@@ -209,3 +209,7 @@ def test_turn_index_projects_spans_and_fails_closed():
     beyond = replace(traj, generation_spans=[(0, 4), (6, 11)])
     index, status = _turn_index(beyond)
     assert status == "invalid_span" and (index == -1).all()
+
+
+def test_single_token_repetitions_are_position_independent():
+    assert repetition_first_hit([5, 9, 5, 9, 5], ngram_size=1, window_size=5, min_content_length=0, min_repeat=3) == 5

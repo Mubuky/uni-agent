@@ -189,3 +189,34 @@ async def test_stream_failure_is_reported_without_a_completed_event():
     wire = b"".join([chunk async for chunk in response.body_iterator])
     assert b"event: response.failed" in wire and b"event: error" in wire
     assert b"event: response.completed" not in wire
+
+
+@pytest.mark.asyncio
+async def test_incomplete_xml_call_returns_harness_feedback():
+    codec = MessageCodec(FakeTokenizer(), tool_parser_name="qwen3_xml")
+    text = "<tool_call><function=exec>await tools.exec_command("
+    message, finish = await codec.decode_response(
+        list(map(ord, text)), tools=[{"type": "function", "function": {"name": "exec"}}], stop_reason="length"
+    )
+    assert finish == "length"
+    assert message["tool_calls"][0]["function"]["name"] == "__malformed_tool_call__"
+    assert text in message["tool_calls"][0]["function"]["arguments"]["raw_body"]
+
+
+def test_custom_template_view_keeps_raw_input_and_schema():
+    codec = MessageCodec(FakeTokenizer())
+    tools = [{"type": "custom", "name": "exec", "format": {"type": "text"}}]
+    internal = request(
+        [
+            {"role": "user", "content": "work"},
+            {"type": "custom_tool_call", "call_id": "a", "name": "exec", "input": "text(1);"},
+        ],
+        tools,
+    )
+    codec._freeform_tool_calls = True
+    assert codec.model_tools_for(internal["tools"]) == tools
+    projected = codec.model_messages_for(internal["messages"], internal["tools"])
+    assert projected[-1]["tool_calls"] == [{"name": "exec", "input": "text(1);"}]
+    codec._freeform_tool_calls = False
+    assert codec.model_tools_for(internal["tools"])[0]["function"]["parameters"]["required"] == ["input"]
+    assert "custom" in internal["tools"][0]

@@ -23,6 +23,9 @@ from verl.utils.tokenizer.continuous_token import MergeResult, VLContinuousToken
 from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
 
 # Map backend stop_reason values into the gateway's internal finish_reason vocabulary.
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_FUNCTION_BLOCK_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
+
 _FREEFORM_PROBE_NAME = "__uni_agent_freeform_probe__"
 _FREEFORM_PROBE_BODY = "__uni_agent_freeform_body__"
 
@@ -636,7 +639,10 @@ class MessageCodec:
         text = self._tokenizer.decode(response_ids, skip_special_tokens=False)
         pattern = r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>"
         blocks = list(re.finditer(pattern, text, re.DOTALL))
-        if any(match[2].strip() and "<parameter=" not in match[2] for match in blocks):
+        xml_parser = parser_name in {"qwen", "qwen25", "qwen3", "qwen3_xml", "qwen3_coder"}
+        if xml_parser and not blocks and self._has_malformed_tool_envelope(text):
+            return self._malformed_tool_call_result(text)
+        if xml_parser and any(match[2].strip() and "<parameter=" not in match[2] for match in blocks):
             calls = []
             for match in blocks:
                 if match[2].strip() and "<parameter=" not in match[2]:
@@ -645,7 +651,11 @@ class MessageCodec:
                     ids = self._tokenizer.encode(match[0], add_special_tokens=False)
                     _, parsed = await self._extract_tool_calls(ids, tools, parser_name)
                     calls.extend(parsed)
-            return re.sub(pattern, "", text, flags=re.DOTALL), calls
+            remaining = re.sub(pattern, "", text, flags=re.DOTALL)
+            if self._has_malformed_tool_envelope(remaining):
+                remaining, malformed = self._malformed_tool_call_result(remaining)
+                calls.extend(malformed)
+            return remaining, calls
         parser_backend = self._rollout_backend if self._rollout_backend in {"sglang", "vllm"} else "verl"
 
         try:
@@ -741,3 +751,37 @@ class MessageCodec:
         while stripped.endswith(eos):
             stripped = stripped[: -len(eos)].rstrip()
         return stripped if stripped != content.rstrip() else content
+
+    @staticmethod
+    def _malformed_tool_call(name: str, body: str) -> SimpleNamespace:
+        del name
+        return SimpleNamespace(
+            name="__malformed_tool_call__",
+            arguments=json.dumps(
+                {"error": "malformed or incomplete tool call", "raw_body": body},
+                ensure_ascii=False,
+            ),
+        )
+
+    @classmethod
+    def _malformed_tool_call_from_text(cls, text: str) -> SimpleNamespace:
+        function_match = _FUNCTION_BLOCK_RE.search(text)
+        if function_match is None:
+            return cls._malformed_tool_call("", text)
+        return cls._malformed_tool_call(function_match.group(1).strip(), function_match.group(2))
+
+    @classmethod
+    def _malformed_tool_call_result(cls, text: str) -> tuple[str, list[SimpleNamespace]]:
+        start = text.find("<tool_call>")
+        return text[:start], [cls._malformed_tool_call_from_text(text[start:])]
+
+    @staticmethod
+    def _has_malformed_tool_envelope(text: str) -> bool:
+        """Detect an incomplete XML tool envelope without parsing arguments."""
+        if text.count("<tool_call>") > text.count("</tool_call>"):
+            return True
+        for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+            inner = match.group(1)
+            if "<function=" in inner and _FUNCTION_BLOCK_RE.search(inner) is None:
+                return True
+        return "<tool_call>" in text and text.count("<function=") > text.count("</function>")

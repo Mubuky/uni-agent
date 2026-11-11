@@ -945,11 +945,19 @@ class GatewayAgentFramework(AgentFramework):
                 except Exception:
                     logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
                 raise
-            except Exception:
+            except Exception as error:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
                 partial = await self.gateway_manager.abort_session(session_id)
                 if run_dir is not None:
                     await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, partial or [])
+                    await asyncio.to_thread(
+                        self._dump_session_record,
+                        run_dir,
+                        session_id,
+                        status="failed",
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                    )
                 session_trace.finish(
                     runner_name=runner_name,
                     status="failure",
@@ -977,6 +985,8 @@ class GatewayAgentFramework(AgentFramework):
                 session_trajectories = await self._apply_trajectory_postprocessor(session_trajectories, task_result)
 
             if not session_trajectories:
+                if run_dir is not None:
+                    await asyncio.to_thread(self._dump_session_record, run_dir, session_id, status="empty")
                 session_trace.finish(
                     runner_name=runner_name,
                     status="empty",
@@ -1011,6 +1021,14 @@ class GatewayAgentFramework(AgentFramework):
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
                 await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+                await asyncio.to_thread(
+                    self._dump_session_record,
+                    run_dir,
+                    session_id,
+                    status="completed",
+                    finished=task_result.finished,
+                    num_trajectories=len(result_trajectories),
+                )
             session_trace.finish(
                 runner_name=runner_name,
                 status="success",
@@ -1226,6 +1244,17 @@ class GatewayAgentFramework(AgentFramework):
             )
         except Exception:
             logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
+
+    def _dump_session_record(self, run_dir: Path, session_id: str, **fields) -> None:
+        """Record lifecycle status independently of training admission."""
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "session.json").write_text(
+                json.dumps({"session_id": session_id, **fields}, ensure_ascii=False, default=_json_default),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.exception("session %s: failed to write lifecycle record", session_id)
 
     def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""
