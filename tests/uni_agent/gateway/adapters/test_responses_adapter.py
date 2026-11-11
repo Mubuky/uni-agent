@@ -426,6 +426,95 @@ def test_responses_rejects_parallel_tool_calls_false_at_request_entry():
         )
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("tool_mode", ["omitted", "empty", "null", "disabled", "deferred"])
+@pytest.mark.asyncio
+async def test_tool_free_compaction_accepts_parallel_false(stream, tool_mode):
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    payload = _request(
+        stream=stream,
+        parallel_tool_calls=False,
+        input=[
+            {"role": "user", "content": "inspect"},
+            {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "input": "pwd"},
+            {"type": "custom_tool_call_output", "call_id": "call-1", "output": "/workspace"},
+            {"role": "user", "content": "Summarize the work so far."},
+        ],
+    )
+    if tool_mode == "omitted":
+        payload.pop("tools")
+    elif tool_mode in {"empty", "null"}:
+        payload["tools"] = [] if tool_mode == "empty" else None
+    elif tool_mode == "disabled":
+        payload["tool_choice"] = "none"
+    else:
+        payload["tools"][0]["defer_loading"] = True
+    original = copy.deepcopy(payload)
+    generate = AsyncMock(return_value=_outcome(content="Work summary", finish_reason="stop"))
+    actor = _make_actor(sessions={"s1": SimpleNamespace(sampling_params={}, run_generation=generate)})
+    actor._app = FastAPI()
+    actor._register_routes()
+    async with AsyncClient(transport=ASGITransport(app=actor._app), base_url="http://test") as client:
+        response = await client.post("/sessions/s1/v1/responses", json=payload)
+    assert response.status_code == 200
+    if stream:
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+        completed = next(event for event in events if event["type"] == "response.completed")
+        body = completed["response"]
+    else:
+        body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"][-1]["content"][0]["text"] == "Work summary"
+    generate.assert_awaited_once()
+    internal = generate.await_args.args[0]
+    assert not internal["tools"]
+    assert internal["messages"][-2] == {"role": "tool", "tool_call_id": "call-1", "content": "/workspace"}
+    assert payload == original
+
+
+@pytest.mark.parametrize("tool_choice", ["auto", "none"])
+def test_parallel_false_uses_tools_from_input(tool_choice):
+    from uni_agent.gateway.adapters.openai_response import responses_to_internal
+    from uni_agent.gateway.adapters.types import MalformedRequestError
+
+    payload = _request(tools=[], parallel_tool_calls=False, tool_choice=tool_choice)
+    payload["input"].append({"type": "additional_tools", "tools": _request()["tools"]})
+    if tool_choice == "auto":
+        with pytest.raises(MalformedRequestError, match="parallel_tool_calls=false"):
+            responses_to_internal(payload, base_sampling_params={}, allowed_sampling_keys=ALLOWED_SAMPLING_KEYS)
+    else:
+        internal = responses_to_internal(payload, base_sampling_params={}, allowed_sampling_keys=ALLOWED_SAMPLING_KEYS)
+        assert not internal["tools"]
+
+
+@pytest.mark.parametrize("parallel", [None, 0, 1, "false", [], {}])
+def test_tool_free_requests_require_a_boolean_parallel_flag(parallel):
+    from uni_agent.gateway.adapters.openai_response import responses_to_internal
+    from uni_agent.gateway.adapters.types import MalformedRequestError
+
+    with pytest.raises(MalformedRequestError, match="parallel_tool_calls must be a boolean"):
+        responses_to_internal(
+            _request(tools=[], parallel_tool_calls=parallel),
+            base_sampling_params={},
+            allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+        )
+
+
+@pytest.mark.parametrize("tools", [{}, False, 0, ""])
+def test_falsey_non_list_tools_are_rejected(tools):
+    from uni_agent.gateway.adapters.openai_response import responses_to_internal
+    from uni_agent.gateway.adapters.types import MalformedRequestError
+
+    with pytest.raises(MalformedRequestError, match="tools must be a list"):
+        responses_to_internal(
+            _request(tools=tools, parallel_tool_calls=False),
+            base_sampling_params={},
+            allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+        )
+
+
 @pytest.mark.parametrize("parallel", [True, "omitted"])
 def test_responses_accepts_parallel_tool_calls_true_or_default(parallel):
     from uni_agent.gateway.adapters.openai_response import responses_to_internal

@@ -329,7 +329,9 @@ def _merge_tool_channels(top: list[Any], additional: list[Any]) -> list[Any]:
 
 
 def _collect_tool_defs(payload: dict[str, Any]) -> list[Any]:
-    top = payload.get("tools") or []
+    top = payload.get("tools")
+    if top is None:
+        top = []
     if not isinstance(top, list):
         raise MalformedRequestError("tools must be a list")
     additional: list[Any] = []
@@ -510,9 +512,6 @@ def responses_to_internal(
     if type(parallel_tool_calls) is not bool:
         raise MalformedRequestError("parallel_tool_calls must be a boolean")
 
-    if parallel_tool_calls is False:
-        raise MalformedRequestError("parallel_tool_calls=false is not supported")
-
     tool_choice_payload = payload.get("tool_choice", "auto")
     if isinstance(tool_choice_payload, str):
         tool_choice = tool_choice_payload.lower()
@@ -530,10 +529,14 @@ def responses_to_internal(
         raise MalformedRequestError("tool_choice must be a string or object")
 
     converted_tools, _, _ = _convert_tools(_collect_tool_defs(payload), drop_deferred=True)
+    effective_tools = None if tool_choice == "none" else converted_tools or None
+    if parallel_tool_calls is False and effective_tools:
+        raise MalformedRequestError("parallel_tool_calls=false is not supported with callable tools")
+
     chat_payload: dict[str, Any] = {
         **payload,
         "messages": _messages_from_input(payload),
-        "tools": None if tool_choice == "none" else converted_tools or None,
+        "tools": effective_tools,
         "tool_choice": tool_choice,
     }
     max_output_tokens = chat_payload.pop("max_output_tokens", None)

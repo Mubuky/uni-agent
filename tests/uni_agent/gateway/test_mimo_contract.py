@@ -26,9 +26,9 @@ class Backend:
         return TokenOutput(token_ids=ids, log_probs=[-0.25] * len(ids), stop_reason="stop")
 
 
-def request(items, tools=None):
+def request(items, tools=None, **fields):
     return responses_to_internal(
-        {"input": items, "tools": tools or []},
+        {"input": items, "tools": tools or [], **fields},
         base_sampling_params={"logprobs": True},
         allowed_sampling_keys=frozenset(),
     )
@@ -48,7 +48,8 @@ async def test_responses_compaction_preserves_tokens_masks_and_generation_spans(
             + [
                 {"role": "assistant", "content": "first"},
                 {"role": "user", "content": "tool observation"},
-            ]
+            ],
+            parallel_tool_calls=False,
         ),
         backend,
     )
