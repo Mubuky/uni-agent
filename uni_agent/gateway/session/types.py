@@ -57,7 +57,6 @@ class SessionHandle:
 
     session_id: str
     base_url: str | None = None
-    activity_url: str | None = None
 
 
 @dataclass

@@ -3,17 +3,15 @@
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
 from tests.uni_agent.support import FakeTokenizer
-from uni_agent.framework.framework import AgentRequestTimeout, GatewayAgentFramework
+from uni_agent.framework.framework import GatewayAgentFramework
 from uni_agent.gateway.adapters.openai_response import responses_build_response, responses_to_internal
 from uni_agent.gateway.session import GatewaySession, MessageCodec, SessionHandle
 from uni_agent.gateway.session.tree_session import TreeGatewaySession
-from uni_agent.tasks import TaskResult
 from verl.workers.rollout.replica import TokenOutput
 
 
@@ -117,42 +115,6 @@ async def test_abort_returns_unscored_snapshot_and_releases_session(session_cls)
 
 
 @pytest.mark.asyncio
-async def test_idle_wait_returns_typed_result_and_ignores_grading():
-    framework = GatewayAgentFramework(
-        SimpleNamespace(
-            get_session_state=AsyncMock(
-                return_value={
-                    "agent_finished": True,
-                    "awaiting_external_followup": True,
-                    "awaiting_external_followup_seconds": 99.0,
-                }
-            )
-        ),
-        runner_registry={},
-    )
-    framework._RUNNER_ACTIVITY_POLL_SECONDS = 0.001
-
-    async def grading():
-        await asyncio.sleep(0.01)
-        return TaskResult(reward=0.5, finished=True)
-
-    result = await framework._wait_for_runner_task(
-        grading(), session_id="s", session_timeout_seconds=1.0, request_idle_timeout_seconds=0.001
-    )
-    assert result.reward == 0.5
-    framework.gateway_manager.get_session_state.return_value["agent_finished"] = False
-    pending = asyncio.create_task(asyncio.sleep(1))
-    try:
-        with pytest.raises(AgentRequestTimeout):
-            await framework._wait_for_runner_task(
-                pending, session_id="s", session_timeout_seconds=1.0, request_idle_timeout_seconds=0.001
-            )
-    finally:
-        pending.cancel()
-        await asyncio.gather(pending, return_exceptions=True)
-
-
-@pytest.mark.asyncio
 async def test_stream_sends_progress_before_generation_and_cancels_on_disconnect():
     import json
 
@@ -224,7 +186,7 @@ def test_custom_template_view_keeps_raw_input_and_schema():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tree", [False, True])
-async def test_http_responses_and_activity_routes_use_native_session(tree):
+async def test_http_responses_route_uses_native_session(tree):
     import httpx
 
     from uni_agent.gateway.config import GatewayActorConfig
@@ -244,9 +206,6 @@ async def test_http_responses_and_activity_routes_use_native_session(tree):
         assert response.status_code == 200
         assert "event: response.created" in response.text
         assert "event: response.completed" in response.text
-        activity = await client.post(handle.activity_url, json={"agent_finished": True})
-        assert activity.status_code == 200
-        assert (await actor.get_session_state("http"))["agent_finished"] is True
     trajectories = await actor.finalize_session("http")
     assert trajectories[0].response_ids == list(map(ord, "done"))
     assert trajectories[0].response_logprobs == [-0.25] * 4

@@ -113,10 +113,6 @@ class GatewayManager:
             self._session_to_gateway_index.pop(session_id, None)
             self.active_sessions_per_gateway[gateway_index] -= 1
 
-    async def get_session_state(self, session_id: str) -> dict[str, object]:
-        gateway, _ = self._get_gateway(session_id)
-        return await gateway.get_session_state.remote(session_id=session_id)
-
     async def shutdown(self) -> None:
         """Stop owned gateway actors and clear routing state."""
         if self.gateways:

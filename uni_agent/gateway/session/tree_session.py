@@ -21,7 +21,6 @@ from uni_agent.gateway.session.session import (
     GenerationOutcome,
     InflightRequest,
     SessionPhase,
-    track_activity,
 )
 from uni_agent.gateway.session.types import (
     AgentContext,
@@ -141,7 +140,6 @@ class TreeGatewaySession(GatewaySession):
         log_dir = self._metadata.get("_log_dir")
         self._storage_path = Path(log_dir) / "trajectory_tree.pkl" if log_dir else None
 
-    @track_activity
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Coalesce identical requests and overlap backend calls within the session."""
         agent_context = request["agent_context"].copy() if request.get("agent_context") is not None else None
@@ -435,7 +433,6 @@ class TreeGatewaySession(GatewaySession):
         """Read in-memory metadata without waiting for locks or performing I/O."""
         chain_ids = sorted(chain_id for chain_id, leaf in self.leaves.items() if isinstance(leaf, MessageNode))
         return {
-            **self.activity_state(),
             "session_id": self.handle.session_id,
             "phase": self.phase.value,
             "created_at": self.created_at,

@@ -9,7 +9,6 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import wraps
 from typing import Any
 
 from fastapi import HTTPException
@@ -32,20 +31,6 @@ _TRAJECTORY_CAPACITY_HINT = (
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS alone will not help. Check the rollout prompt_length/response_length "
     "budget or compact context earlier; the episode may be unfinished."
 )
-
-
-def track_activity(generate):
-    @wraps(generate)
-    async def tracked(self, *args, **kwargs):
-        self._activity_requests += 1
-        self._touch()
-        try:
-            return await generate(self, *args, **kwargs)
-        finally:
-            self._activity_requests -= 1
-            self._touch()
-
-    return tracked
 
 
 class SessionPhase(str, Enum):
@@ -262,15 +247,12 @@ class GatewaySession:
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.request_lock = asyncio.Lock()
-        self.agent_finished = False
-        self._activity_requests = 0
 
     @property
     def sampling_params(self) -> dict[str, Any]:
         """Return a copy of the trusted per-session sampling defaults."""
         return dict(self._sampling_params)
 
-    @track_activity
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Run one provider-normalized generation request and return its business outcome.
 
@@ -564,27 +546,9 @@ class GatewaySession:
             self._touch()
             return snapshots
 
-    def activity_state(self):
-        pending = sorted(
-            {
-                str(call["id"])
-                for chain in self.active_chains
-                for call in chain.message_history[-1].get("tool_calls", [])
-                if chain.message_history and call.get("id")
-            }
-        )
-        return {
-            "in_flight_requests": self._activity_requests,
-            "agent_finished": self.agent_finished,
-            "pending_tool_call_ids": pending,
-            "awaiting_external_followup": bool(pending) and not self.agent_finished,
-            "awaiting_external_followup_seconds": max(0.0, time.time() - self.updated_at) if pending else None,
-        }
-
     def snapshot_state(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot for actor state inspection."""
         return {
-            **self.activity_state(),
             "session_id": self.handle.session_id,
             "phase": self.phase.value,
             "created_at": self.created_at,

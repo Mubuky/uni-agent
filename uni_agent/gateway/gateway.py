@@ -204,18 +204,6 @@ class _GatewayActor:
                 session_id=session_id, payload=payload, agent_context=agent_context_from_headers(request.headers)
             )
 
-        @self._app.post("/sessions/{session_id}/activity")
-        async def _activity(session_id: str, request: Request):
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise HTTPException(status_code=404, detail="Unknown session_id")
-            payload = await request.json()
-            if not isinstance(payload, dict) or type(payload.get("agent_finished")) is not bool:
-                raise HTTPException(status_code=400, detail="agent_finished must be a bool")
-            session.agent_finished = payload["agent_finished"]
-            session._touch()
-            return {"agent_finished": session.agent_finished}
-
         @self._app.post("/sessions/{session_id}/v1/responses")
         async def _openai_responses(session_id: str, request: Request):
             try:
@@ -418,7 +406,6 @@ class _GatewayActor:
         handle = SessionHandle(
             session_id=session_id,
             base_url=f"{self._server_base_url}/sessions/{session_id}/v1",
-            activity_url=f"{self._server_base_url}/sessions/{session_id}/activity",
         )
         session_cls = TreeGatewaySession if config.use_tree_trajectory_manager else GatewaySession
         self._sessions[session_id] = session_cls(

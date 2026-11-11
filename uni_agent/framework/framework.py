@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import random
-import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -57,7 +56,6 @@ class _RunnerConfig:
     max_concurrent_sessions: int
     trajectory_selection: str = "all"
     session_timeout_seconds: float | None = None
-    agent_request_idle_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.runner_fqn:
@@ -68,8 +66,6 @@ class _RunnerConfig:
             raise ValueError(f"max_concurrent_sessions must be non-negative, got {self.max_concurrent_sessions}")
         if self.trajectory_selection not in {"all", "longest"}:
             raise ValueError(f"Unknown trajectory selection: {self.trajectory_selection}. Expected 'all' or 'longest'")
-        if self.agent_request_idle_timeout_seconds is not None and self.agent_request_idle_timeout_seconds <= 0:
-            raise ValueError("agent_request_idle_timeout_seconds must be positive")
         if self.session_timeout_seconds is not None and self.session_timeout_seconds <= 0:
             raise ValueError(f"session_timeout_seconds must be positive, got {self.session_timeout_seconds}")
 
@@ -100,7 +96,6 @@ class _RunnerConfig:
                 max_concurrent_sessions=max_concurrent_sessions,
                 trajectory_selection=trajectory_selection,
                 session_timeout_seconds=session_timeout_seconds,
-                agent_request_idle_timeout_seconds=runner_cfg.get("agent_request_idle_timeout_seconds"),
             )
         except ValueError as exc:
             raise ValueError(f"agent_runners.{runner_name}: {exc}") from exc
@@ -324,17 +319,6 @@ def _trajectory_to_reward_dataproto(trajectory, sample_fields, task_result: Task
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 
-class AgentRequestTimeout(asyncio.TimeoutError):
-    """The external agent stopped sending requests after a model tool call."""
-
-    def __init__(self, *, idle_seconds: float, pending_tool_call_ids: list[str]):
-        self.idle_seconds = idle_seconds
-        self.pending_tool_call_ids = list(pending_tool_call_ids)
-        super().__init__(
-            f"agent sent no follow-up request for {idle_seconds:.1f}s after tool calls {self.pending_tool_call_ids}"
-        )
-
-
 class GatewayAgentFramework(AgentFramework):
     """Reference AgentFramework implementation for Gateway-backed agent loops.
 
@@ -351,7 +335,6 @@ class GatewayAgentFramework(AgentFramework):
     #: ray.cancel (letting its sandbox context manager tear down) before the
     #: framework escalates to a force-kill.
     _RUNNER_CANCEL_GRACE_SECONDS = 30.0
-    _RUNNER_ACTIVITY_POLL_SECONDS = 5.0
 
     def __init__(
         self,
@@ -912,12 +895,7 @@ class GatewayAgentFramework(AgentFramework):
                     # unwinds and its sandbox context manager tears down cleanly;
                     # force-kill only if it ignores the cancel.
                     try:
-                        task_result = await self._wait_for_runner_task(
-                            object_ref,
-                            session_id=session_id,
-                            session_timeout_seconds=runner_config.session_timeout_seconds,
-                            request_idle_timeout_seconds=runner_config.agent_request_idle_timeout_seconds,
-                        )
+                        task_result = await asyncio.wait_for(object_ref, timeout=runner_config.session_timeout_seconds)
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         await self._cancel_runner_task(object_ref, session_id)
                         raise
@@ -1042,65 +1020,6 @@ class GatewayAgentFramework(AgentFramework):
                 finished=result_trajectories[0].finished if result_trajectories else None,
             )
             return result_trajectories, sample_fields
-
-    async def _wait_for_runner_task(
-        self,
-        object_ref,
-        *,
-        session_id: str,
-        session_timeout_seconds: float | None,
-        request_idle_timeout_seconds: float | None,
-    ):
-        """Wait for a Ray runner with separate wall and external-request idle budgets."""
-        if session_timeout_seconds is None and request_idle_timeout_seconds is None:
-            return await object_ref
-
-        runner_wait_task = asyncio.ensure_future(asyncio.shield(object_ref))
-        started_at = time.monotonic()
-        try:
-            while not runner_wait_task.done():
-                remaining_wall = (
-                    session_timeout_seconds - (time.monotonic() - started_at)
-                    if session_timeout_seconds is not None
-                    else None
-                )
-                if remaining_wall is not None and remaining_wall <= 0:
-                    raise asyncio.TimeoutError(f"session exceeded wall timeout of {session_timeout_seconds:.1f}s")
-
-                wait_seconds = self._RUNNER_ACTIVITY_POLL_SECONDS
-                if remaining_wall is not None:
-                    wait_seconds = min(wait_seconds, remaining_wall)
-                if request_idle_timeout_seconds is not None:
-                    wait_seconds = min(wait_seconds, request_idle_timeout_seconds)
-                done, _ = await asyncio.wait({runner_wait_task}, timeout=wait_seconds)
-                if done:
-                    break
-
-                if request_idle_timeout_seconds is None:
-                    continue
-                try:
-                    state = await self.gateway_manager.get_session_state(session_id)
-                except Exception:
-                    logger.warning("session %s: failed to inspect request-idle state", session_id, exc_info=True)
-                    continue
-                if runner_wait_task.done() or int(state.get("in_flight_requests", 0)) > 0:
-                    continue
-                if state.get("agent_finished"):
-                    continue
-                idle_seconds = state.get("awaiting_external_followup_seconds")
-                if not state.get("awaiting_external_followup") or idle_seconds is None:
-                    continue
-                idle_seconds = float(idle_seconds)
-                if idle_seconds >= request_idle_timeout_seconds:
-                    raise AgentRequestTimeout(
-                        idle_seconds=idle_seconds,
-                        pending_tool_call_ids=[str(value) for value in state.get("pending_tool_call_ids", [])],
-                    )
-
-            return await runner_wait_task
-        finally:
-            if not runner_wait_task.done():
-                runner_wait_task.cancel()
 
     async def _cancel_runner_task(self, object_ref, session_id: str) -> None:
         """Cancel a dispatched runner Ray task after its session timed out.
