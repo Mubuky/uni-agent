@@ -1835,10 +1835,18 @@ async def test_text_only_image_is_http_400_before_generation(endpoint, stream, i
         transport = httpx.ASGITransport(app=actor._app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             response = await client.post(f"/sessions/media-error/v1/{endpoint}", json=payload)
-        assert response.status_code == 400
-        assert response.headers["content-type"].startswith("application/json")
-        assert response.json()["error"]["type"] == "invalid_request_error"
-        assert "multimodal processor" in response.json()["error"]["message"]
+        if stream and endpoint == "responses":
+            assert response.status_code == 200
+            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+            failure = next(event for event in events if event["type"] == "response.failed")
+            assert failure["response"]["error"]["code"] == "invalid_request_error"
+            assert "multimodal processor" in failure["response"]["error"]["message"]
+            assert not any(event["type"] == "response.completed" for event in events)
+        else:
+            assert response.status_code == 400
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json()["error"]["type"] == "invalid_request_error"
+            assert "multimodal processor" in response.json()["error"]["message"]
         assert backend.calls == []
         assert await actor.finalize_session("media-error") == []
     finally:
@@ -1932,13 +1940,20 @@ async def test_media_extractor_value_error_remains_http_500(endpoint, stream):
         transport = httpx.ASGITransport(app=actor._app, raise_app_exceptions=False)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             response = await client.post(f"/sessions/decoder-error/v1/{endpoint}", json=payload)
-        assert response.status_code == 500
-        assert response.json()["error"] == {
-            "type": "internal_server_error",
-            "message": "Internal server error",
-            "code": None,
-            "param": None,
-        }
+        if stream and endpoint == "responses":
+            assert response.status_code == 200
+            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+            failure = next(event for event in events if event["type"] == "response.failed")
+            assert failure["response"]["error"]["code"] == "internal_error"
+            assert not any(event["type"] == "response.completed" for event in events)
+        else:
+            assert response.status_code == 500
+            assert response.json()["error"] == {
+                "type": "internal_server_error",
+                "message": "Internal server error",
+                "code": None,
+                "param": None,
+            }
         assert backend.calls == []
     finally:
         await actor.shutdown()

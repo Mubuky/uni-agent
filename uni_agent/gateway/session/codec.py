@@ -180,19 +180,10 @@ def _split_generation_thinking(text: str, *, prompt_opens_thinking: bool) -> tup
     return None, text
 
 
-def _canonicalize_tool_arguments_for_comparison(arguments: Any) -> tuple[str, Any]:
-    if isinstance(arguments, dict | list):
-        canonical: tuple[str, Any] = ("json", arguments)
-    elif isinstance(arguments, str):
-        try:
-            canonical = ("json", json.loads(arguments))
-        except json.JSONDecodeError:
-            canonical = ("raw", arguments)
-    else:
-        canonical = ("raw", arguments)
-
-    if canonical[0] == "json" and isinstance(canonical[1], dict) and set(canonical[1]) == {"input"}:
-        return _canonicalize_tool_arguments_for_comparison(canonical[1]["input"])
+def _canonicalize_tool_arguments_for_comparison(arguments: Any) -> Any:
+    canonical = normalize_tool_arguments(arguments)
+    if isinstance(canonical, dict) and set(canonical) == {"input"}:
+        return _canonicalize_tool_arguments_for_comparison(canonical["input"])
     return canonical
 
 

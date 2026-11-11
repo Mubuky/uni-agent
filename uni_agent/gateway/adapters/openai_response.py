@@ -772,9 +772,12 @@ def responses_stream_response(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                failed = {**in_progress, "status": "failed", "error": {"code": "internal_error", "message": str(exc)}}
+                status_code = getattr(exc, "status_code", 500)
+                code = "invalid_request_error" if 400 <= status_code < 500 else "internal_error"
+                message = str(getattr(exc, "detail", str(exc)))
+                failed = {**in_progress, "status": "failed", "error": {"code": code, "message": message}}
                 yield _event_to_sse(event("response.failed", response=failed))
-                yield _event_to_sse(event("error", code="internal_error", message=str(exc), param=None))
+                yield _event_to_sse(event("error", code=code, message=message, param=None))
                 return
             finally:
                 if not task.done():
