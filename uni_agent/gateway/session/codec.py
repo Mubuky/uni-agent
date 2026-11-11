@@ -232,6 +232,10 @@ def _tool_name(tool: Any) -> str | None:
     return str(name) if name else None
 
 
+class ToolParserPayloadError(ValueError):
+    """The selected tool parser rejected generated payload bytes."""
+
+
 class MessageCodec:
     """Model-scoped request codec used by gateway sessions.
 
@@ -543,10 +547,69 @@ class MessageCodec:
             if self._enable_tool_parser_cache:
                 self._tool_parser_cache[cache_key] = parser
 
-        if not parser.has_tool_call(text):
+        try:
+            has_tool_call = parser.has_tool_call(text)
+        except ValueError as exc:
+            raise ToolParserPayloadError("SGLang rejected the model tool payload") from exc
+        if not has_tool_call:
             return text, []
-        content, calls = parser.parse_non_stream(text)
-        return content, [SimpleNamespace(name=call.name, arguments=call.parameters) for call in calls]
+
+        blocks = self._sglang_tool_call_blocks(text, tools)
+        if not blocks:
+            if _TOOL_CALL_BLOCK_RE.search(text) is None and "<tool_call>" in text:
+                return self._malformed_tool_call_result(text)
+            try:
+                content, calls = parser.parse_non_stream(text)
+            except ValueError as exc:
+                raise ToolParserPayloadError("SGLang rejected the model tool payload") from exc
+            return content, [SimpleNamespace(name=call.name, arguments=call.parameters) for call in calls]
+
+        parsed_calls: list[Any] = []
+        for start, end, name, body in blocks:
+            if self._is_direct_function_body(body):
+                parsed_calls.append(
+                    SimpleNamespace(
+                        name=name,
+                        arguments=body if body.strip() else "{}",
+                    )
+                )
+                continue
+
+            try:
+                _, regular_calls = parser.parse_non_stream(text[start:end])
+            except ValueError as exc:
+                raise ToolParserPayloadError("SGLang rejected the model tool payload") from exc
+            if regular_calls:
+                parsed_calls.extend(
+                    SimpleNamespace(name=call.name, arguments=call.parameters) for call in regular_calls
+                )
+            else:
+                declared_names = {
+                    (tool.get("function") or {}).get("name")
+                    for tool in tools
+                    if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                }
+                if name not in declared_names:
+                    parsed_calls.append(SimpleNamespace(name=name, arguments=body or "{}"))
+                else:
+                    parsed_calls.append(self._malformed_tool_call(name, body))
+
+        normal_parts: list[str] = []
+        cursor = 0
+        for start, end, *_ in blocks:
+            normal_parts.append(text[cursor:start])
+            cursor = end
+        normal_parts.append(text[cursor:])
+        result = "".join(normal_parts), parsed_calls
+
+        last_end = blocks[-1][1]
+        unmatched = text.find("<tool_call>", last_end)
+        if unmatched >= 0:
+            result = (
+                result[0][:unmatched],
+                result[1] + [self._malformed_tool_call_from_text(text[unmatched:])],
+            )
+        return result
 
     def _process_tool_calls_vllm(
         self,
@@ -657,6 +720,8 @@ class MessageCodec:
                 vllm_name = _VLLM_TOOL_PARSER_ALIASES.get(parser_name, parser_name)
                 return self._process_tool_calls_vllm(text, tools, vllm_name)
             return await self._process_tool_calls_verl(response_ids, tools, parser_name)
+        except ToolParserPayloadError:
+            return self._malformed_tool_call_result(text)
         except Exception as exc:
             raise RuntimeError(f"{parser_backend} tool parser {parser_name!r} failed") from exc
 
@@ -776,3 +841,42 @@ class MessageCodec:
             if "<function=" in inner and _FUNCTION_BLOCK_RE.search(inner) is None:
                 return True
         return "<tool_call>" in text and text.count("<function=") > text.count("</function>")
+
+    @staticmethod
+    def _is_direct_function_body(body: str) -> bool:
+        """Recognize a body placed directly inside ``<function=...>``.
+
+        The stock Qwen3-Coder detector only reads ``<parameter=...>`` tags. A
+        model using the v2.6 MiMo template may instead place a complete JSON
+        object, JavaScript, or another raw payload directly inside
+        ``<function=...>``. Keep it as-is and let the harness perform the final
+        object/schema validation. Returning malformed text preserves a useful
+        format error rather than irreversibly replacing the model payload with
+        ``{}``.
+        """
+        stripped = body.strip()
+        if not stripped or "<parameter=" in stripped:
+            return False
+        return True
+
+    @staticmethod
+    def _sglang_tool_call_blocks(
+        text: str,
+        tools: list[dict[str, Any]],
+    ) -> list[tuple[int, int, str, str]]:
+        """Return ordered complete ``<tool_call>`` blocks.
+
+        The parser-facing tool schema is intentionally irrelevant here. The
+        body shape determines the dialect: parameter-tag bodies go through the
+        stock SGLang parser, while direct bodies are retained verbatim for the
+        harness (ordinary JSON and custom/freeform payloads alike).
+        """
+        blocks: list[tuple[int, int, str, str]] = []
+        for match in _TOOL_CALL_BLOCK_RE.finditer(text):
+            function_match = _FUNCTION_BLOCK_RE.search(match.group(1))
+            if function_match is None:
+                continue
+            name = function_match.group(1).strip()
+            body = function_match.group(2)
+            blocks.append((match.start(), match.end(), name, body))
+        return blocks

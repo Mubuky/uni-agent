@@ -273,3 +273,44 @@ async def test_empty_generation_retains_turn_alignment(session_cls):
         trajectory=trajectories[0], sample_fields={}, session_index=0, global_steps=1, uid="empty"
     )
     assert (field["turn_index"][field["response_mask"] == 1] == 1).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["known", "unknown"])
+async def test_suppressed_xml_parameter_calls_reach_the_harness(name):
+    from uni_agent.gateway.session.codec import _canonical_tools_hash
+
+    codec = MessageCodec(FakeTokenizer(), tool_parser_name="qwen3_xml", rollout_backend="sglang")
+    tools = [{"type": "function", "function": {"name": "known", "parameters": {"type": "object"}}}]
+    codec._tool_parser_cache[("sglang", "qwen3_coder", _canonical_tools_hash(tools))] = SimpleNamespace(
+        has_tool_call=lambda text: True, parse_non_stream=lambda text: ("", [])
+    )
+    text = "<tool_call><function=" + name + "><parameter=x>1</parameter></function></tool_call>"
+    message, _ = await codec.decode_response(list(map(ord, text)), tools=tools)
+    call = message["tool_calls"][0]["function"]
+    assert call["name"] == ("__malformed_tool_call__" if name == "known" else "unknown")
+
+
+@pytest.mark.asyncio
+async def test_parser_payload_errors_become_feedback_but_api_errors_propagate():
+    from uni_agent.gateway.session.codec import _canonical_tools_hash
+
+    codec = MessageCodec(FakeTokenizer(), tool_parser_name="qwen3_xml", rollout_backend="sglang")
+    tools = [{"type": "function", "function": {"name": "known", "parameters": {"type": "object"}}}]
+    parser = SimpleNamespace(has_tool_call=lambda text: True)
+    codec._tool_parser_cache[("sglang", "qwen3_coder", _canonical_tools_hash(tools))] = parser
+
+    def fail_payload(text):
+        raise ValueError("bad generated argument")
+
+    parser.parse_non_stream = fail_payload
+    text = "<tool_call><function=known><parameter=x>1</parameter></function></tool_call>"
+    message, _ = await codec.decode_response(list(map(ord, text)), tools=tools)
+    assert message["tool_calls"][0]["function"]["name"] == "__malformed_tool_call__"
+
+    def fail_api(text):
+        raise TypeError("incompatible parser API")
+
+    parser.parse_non_stream = fail_api
+    with pytest.raises(RuntimeError, match="sglang tool parser"):
+        await codec.decode_response(list(map(ord, text)), tools=tools)
