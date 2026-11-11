@@ -840,7 +840,9 @@ class TreeGatewaySession(GatewaySession):
                 del response_ids[-node.removed_prefix_token_count :]
                 del response_mask[-node.removed_prefix_token_count :]
                 generation_spans = [
-                    (start, min(end, len(response_ids))) for start, end in generation_spans if start < len(response_ids)
+                    (start, min(end, len(response_ids)))
+                    for start, end in generation_spans
+                    if start <= len(response_ids)
                 ]
                 if response_logprobs is not None:
                     del response_logprobs[-node.removed_prefix_token_count :]

@@ -250,3 +250,26 @@ async def test_http_responses_and_activity_routes_use_native_session(tree):
     trajectories = await actor.finalize_session("http")
     assert trajectories[0].response_ids == list(map(ord, "done"))
     assert trajectories[0].response_logprobs == [-0.25] * 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_cls", [GatewaySession, TreeGatewaySession])
+async def test_empty_generation_retains_turn_alignment(session_cls):
+    session = session_cls(
+        SessionHandle("empty-turn"), MessageCodec(FakeTokenizer()), sampling_params={"logprobs": True}
+    )
+    backend = Backend("", "next")
+    initial = [{"role": "user", "content": "work"}]
+    await session.run_generation(request(initial), backend)
+    await session.run_generation(
+        request(initial + [{"role": "assistant", "content": ""}, {"role": "user", "content": "continue"}]), backend
+    )
+    trajectories = await session.finalize()
+    assert len(trajectories) == 1
+    assert len(trajectories[0].generation_spans) == 2
+    assert trajectories[0].generation_spans[0] == (0, 0)
+    framework = GatewayAgentFramework(None, runner_registry={}, ship_turn_index=True)
+    field, _ = framework._trajectory_to_tq_field_and_tag(
+        trajectory=trajectories[0], sample_fields={}, session_index=0, global_steps=1, uid="empty"
+    )
+    assert (field["turn_index"][field["response_mask"] == 1] == 1).all()

@@ -872,20 +872,24 @@ class GatewayAgentFramework(AgentFramework):
         tools_kwargs = dict(tools_kwargs or {})
         tools_kwargs["_trace_identity"] = trace_identity
         async with _log_scope(parent_log):
-            session = await self._create_session(
-                session_id,
-                metadata={"_trace_identity": trace_identity, "_log_dir": str(run_dir) if run_dir is not None else None},
-                sampling_params=dict(sampling_params),
-            )
-            logger.info(
-                "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
-                session_id,
-                runner_name,
-                sample_index,
-                session_index,
-                global_steps,
-            )
+            session = None
             try:
+                session = await self._create_session(
+                    session_id,
+                    metadata={
+                        "_trace_identity": trace_identity,
+                        "_log_dir": str(run_dir) if run_dir is not None else None,
+                    },
+                    sampling_params=dict(sampling_params),
+                )
+                logger.info(
+                    "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
+                    session_id,
+                    runner_name,
+                    sample_index,
+                    session_index,
+                    global_steps,
+                )
                 if runner_config.dispatch_mode == "ray_task":
                     # Ray workers run only the runner. Gateway token truth,
                     # finalization, reward scoring, and TQ writes stay in parent.
@@ -941,13 +945,14 @@ class GatewayAgentFramework(AgentFramework):
                 # Parent shutdown/cancellation must not leave the Gateway route
                 # and actor-owned session live after the runner task is gone.
                 try:
-                    await asyncio.shield(self.gateway_manager.abort_session(session_id))
+                    if session is not None:
+                        await asyncio.shield(self.gateway_manager.abort_session(session_id))
                 except Exception:
                     logger.exception("session %s: Gateway abort failed during parent cancellation", session_id)
                 raise
             except Exception as error:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
-                partial = await self.gateway_manager.abort_session(session_id)
+                partial = await self.gateway_manager.abort_session(session_id) if session is not None else []
                 if run_dir is not None:
                     await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, partial or [])
                     await asyncio.to_thread(

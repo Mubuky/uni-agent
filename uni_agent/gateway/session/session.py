@@ -420,7 +420,7 @@ class GatewaySession:
             encoded.buffer.generation_spans = [
                 (start, min(end, generation_start))
                 for start, end in encoded.buffer.generation_spans
-                if start < generation_start
+                if start <= generation_start
             ]
             encoded.buffer.generation_spans.append((generation_start, generation_end))
             encoded.buffer.generation_versions.append(
@@ -718,7 +718,7 @@ class GatewaySession:
                 buffer.generation_spans = [
                     (start, min(end, len(buffer.response_ids)))
                     for start, end in buffer.generation_spans
-                    if start < len(buffer.response_ids)
+                    if start <= len(buffer.response_ids)
                 ]
                 self._assert_response_logprob_alignment(buffer)
                 if appended_images:
