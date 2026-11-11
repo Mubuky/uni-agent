@@ -14,7 +14,8 @@ Reviewed on 2026-11-11:
 | `verl-project/uni-agent:main` | `78348025ac6a5383ad62f17f78e67e943472caef` |
 | `XiaomiMiMo/uni-agent:mimo-oss` | `c63e0b01c375ebede95e01fe92bc367df24e5bf3` |
 | Common ancestor | `eac798589593503924dba0e340c6a6b8f186896e` |
-| Upstream Uni-Agent's unchanged verl gitlink | `2bc6ac46043e31855cea194236ff7548c91817c8` |
+| Upstream Uni-Agent's verl base | `2bc6ac46043e31855cea194236ff7548c91817c8` |
+| Companion verl gitlink | `d799866371163b0762302f2a7e5a1f09e15ee9d8` |
 | Existing downstream MiMo verl | `79090e58195e80a9cfe251c95ae7a78a2132b6e2` |
 
 The MiMo delta is `eac79858..c63e0b01`: 26 files, 5,002 insertions and
@@ -32,7 +33,7 @@ The upstream main head was checked again after implementation and remained
 | Long Responses requests | Start SSE before waiting for model completion, emit `response.in_progress` heartbeats, cancel the generation when the stream closes, and report failures through `response.failed` and `error`. The native output-item serializer, namespaces, custom-tool round trip and completion status are reused. |
 | Generation provenance | Export actual generation spans for linear and tree trajectories. Carry them through context merges, rollback, compaction and shared-prefix materialization. Export semantic and template-facing transcripts alongside native token arrays. |
 | Training signals | Retain MiMo's optional repetition detector, tool-error masks and turn indices in `trajectory_signals.py`. Read annotations from native `runner_reward_info.reward_context`. Keep ordinary `response_mask` and `loss_mask` under native framework ownership. |
-| Activity and lifecycle | Track requests in flight, pending tool calls and activity-based idle time. Expose a separate activity endpoint for `agent_finished` so grading is not mistaken for a stalled tool. Keep failed snapshots unscored, preserve lifecycle records, and release aborted routes. |
+| Failure lifecycle | Keep failed snapshots unscored, preserve lifecycle records, and release aborted routes. Runner waiting and timeouts use the native lifecycle. |
 
 The repetition detector remains disabled by default. `repetition_detect.zero_reward`
 is an explicit opt-in session-wide reward transformation. `ship_turn_index` is
@@ -69,7 +70,7 @@ long-generation heartbeat behavior.
 | Multiple context chains | Native linear manager and shared-prefix tree manager; `trajectory_selection=all` and `{uid}_{session_index}_{index}` keys remain native. |
 | Multimodal URL projection | Native image/video URL normalization and incremental-media checks. |
 | Model EOS injection through the framework | Native backend/model termination configuration; no second tokenizer-to-sampling path. |
-| Reward-info HTTP protocol | Native `TaskResult(reward, accuracy, finished, extra_info)` return. Activity reporting is separate from scoring. |
+| Reward-info HTTP protocol | Native `TaskResult(reward, accuracy, finished, extra_info)` return. |
 | Parser auto-detection and fallback | Explicit native rollout-backend dispatch and parser cache. A parser API/import failure remains an error. |
 | Mixed-harness recipe labels | Native runner selection, harness identity and framework extension hooks. Recipe-specific data-source rewriting remains with the recipe. |
 | Default log-root override | Native explicit `log_dir` / `UNI_AGENT_LOG_DIR`. |
@@ -88,94 +89,89 @@ and new regression coverage; the old test files are not copied wholesale.
 | MiMo source file | Disposition |
 | --- | --- |
 | `framework/entry.py` | Native model/backend configuration replaces tokenizer injection. |
-| `framework/framework.py` | Retain signals, idle waiting and failure evidence; reuse native framework/result/TQ flow; exclude recipe scheduling and metadata policy. |
+| `framework/framework.py` | Retain signals and failure evidence; reuse native framework/result/TQ flow; exclude recipe scheduling and metadata policy. |
 | `gateway/adapters/__init__.py` | Reuse upstream exports. |
 | `gateway/adapters/anthropic.py` | Retain thinking round trip; keep upstream's parallel tool-result ordering fix. |
 | `gateway/adapters/openai.py` | Reuse upstream `openai_chat.py`, including message-level tools. |
 | `gateway/adapters/responses.py` | Reuse upstream `openai_response.py`; retain lazy SSE and freeform-template information there. |
 | `gateway/adapters/types.py` | Reuse upstream request types. |
-| `gateway/gateway.py` | Reuse native routing and policy binding; add activity reporting, lazy Responses generation and abort snapshots. |
+| `gateway/gateway.py` | Reuse native routing and policy binding; add lazy Responses generation and abort snapshots. |
 | `gateway/manager.py` | Retain state inspection and abort-route cleanup; keep upstream placement. |
 | `gateway/session/codec.py` | Retain missing protocol/projection behavior; reuse native Continuous Token and backend parsers. |
-| `gateway/session/session.py` | Retain activity, generation spans and failure snapshots on the upstream manager. |
-| `gateway/session/types.py` | Retain generation/transcript fields and activity URL; keep typed reward fields. |
+| `gateway/session/session.py` | Retain generation spans and failure snapshots on the upstream manager. |
+| `gateway/session/types.py` | Retain generation/transcript fields; keep typed reward fields. |
 
 Source tests cover dataset timeout, runner CPU allocation, request-idle timeout,
 repetition, tool errors, framework generation, Anthropic/Responses adapters,
 gateway actor/manager, continuous tokens, tool dispatch, activity state and
-multiple chains. Dataset-timeout and CPU-allocation tests are excluded with their
-recipe-level features. Retained algorithm tests and new protocol tests are in
+multiple chains. Dataset-timeout, CPU-allocation and activity-idle tests are excluded with their
+recipe-level features. Native runner timeout behavior is retained. Retained algorithm tests and new protocol tests are in
 `tests/uni_agent/framework/{test_repetition_detect,test_tool_call_error_mask,test_rollout_grouping}.py`
 and `tests/uni_agent/gateway/test_mimo_contract.py`; native suites continue to cover
 rollback, coalescing, media, tree branches and framework admission.
 
 ## Compatibility and validation
 
-The existing MiMo verl revision cannot import the new Uni-Agent codec:
-`VLContinuousTokenMixin` is absent. Its `create_continuous_token_builder` factory
-also predates the current `hf_model_type`/processor API. The branch keeps the
-upstream verl gitlink; it does not add an old-codec fallback.
+The reviewed combination is Uni-Agent code `60f4438`, companion verl
+`d799866371163b0762302f2a7e5a1f09e15ee9d8`, and unchanged
+`XiaomiMiMo/mimoagent@c3df8469f250b15e7906487a6d52be4c1827a509`.
+Commit `710a0bf` pins that companion verl in this repository. Its `uni_agent`
+source tree is identical to the tested code (`fb29bc7c978f134070265c38c796d26e717c95df`).
 
-The existing MiMo code runner posts to `SessionHandle.reward_info_url` and returns
-`None`. It needs a consuming-project bridge that returns native `TaskResult` and
-uses `activity_url` for completion activity. Old imports of
-`OpenAICompatibleAgentFramework` and `gateway.adapters.responses`, and consumers
-of `Trajectory.reward_info`, must migrate to native names and typed reward
-context. These are integration changes, not framework compatibility aliases.
+The [verl maintenance branch](https://github.com/Mubuky/verl/tree/mimo-maint)
+uses the current Continuous Token API and returns native `TaskResult` from its
+MiMo runner. Consumers use `trajectory_postprocessor_fqn` and
+`extra_fields.runner_reward_info.reward_context`. Runner waiting, timeouts and
+reward delivery follow the upstream lifecycle. The former MiMo verl revision
+`79090e58` predates the required codec API.
 
-Both verl revisions pass the uneven-context GRPO/loss checks: one successful
-rollout with three contexts plus seven unsuccessful rollouts produces advantage
-`0.875` on each successful context and `-0.125` on each unsuccessful rollout.
-Zero-mask padding and tool/context positions contribute no gradient. Token-level
-importance correction also preserves zero-mask positions.
+The isolated runtime uses Python 3.12.12, Torch 2.11.0, vLLM 0.20.2,
+Transformers 5.10.4, Ray 2.58.0, TensorDict 0.10.0 and TransferQueue 0.1.11.
+All 244 registry dependencies and the three component import paths were checked
+against the frozen consumer manifest. Existing FSDP/offload and vLLM staged-wake
+fixes remain in the consumer. Installation of Torch 2.13.0/vLLM 0.29.0 was blocked
+by remote wheel availability; that runtime combination remains unverified.
 
-Validation runs use CPU synthetic backends and tokenizer fixtures, plus native
-HTTP/ASGI and Ray gateway tests. They do not invoke a model or execute agent tools.
-A real Codex CLI/model rollout, GPU optimizer update and learning comparison are
-separate switch gates. Tests use the existing environment without changing its
-packages: Python 3.12.12, Torch 2.11.0+cu130, Ray 2.58.0, TensorDict 0.10.0 and
-TransferQueue 0.1.8. Upstream's test requirements specify TransferQueue 0.1.11;
-a production TransferQueue service and trainer deployment with that version have
-not been validated here.
+| Scope | Result |
+| --- | --- |
+| Gateway/framework, including native HTTP/SSE, Responses, codec, linear/tree contexts and real Ray gateway actors | 717 passed, 9 skipped, 17 deselected |
+| Native verl multi-trajectory GRPO, loss aggregation, Token-TIS, padding and ReplayBuffer with a real TransferQueue 0.1.11 service | 95 passed |
+| MiMo runner, consumer routing, token contract, native-result monitoring and optimizer membership | 36 passed, 1 skipped |
+| Isolated Codex/model rollout and GPU optimizer update | Blocked by native Responses rejection of a compaction request; no optimizer update |
 
-Test commands (use separate frozen checkouts):
+The nine gateway skips require optional `qwen_vl_utils` or `vllm.parser.qwen3`.
+The 17 deselected level1 checks exercise provider tunnels or live worker-ready
+probes. The consumer skip requires an explicitly configured Docker test image.
+A live SGLang deployment is outside this validation scope.
+
+The live Codex 0.154.0 trial reached model generation, then failed when native
+compaction sent `tools=[]` with `parallel_tool_calls=false`. The current upstream
+adapter rejects that flag before generation. A minimal empty-tool request
+reproduces the rejection; the earlier MiMo adapter accepted it. Codex constructs
+its [compaction prompt](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/compact.rs#L271)
+using [Prompt defaults](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/client_common.rs#L37),
+so this is not a mimoagent result-contract issue. The branch currently retains
+upstream's validation. Live compaction, consumed multi-chain trajectories and a
+nonzero optimizer update remain switching requirements.
+
+The uneven-context regression gives one successful rollout three contexts and
+seven unsuccessful rollouts one context each. Native GRPO assigns `0.875` to
+each successful context and `-0.125` to each unsuccessful rollout. Context,
+tool-result and padding positions have zero gradient; Token-TIS preserves those
+masks. Compacted request histories use the same native chain construction and
+alignment paths as the retained generation-span export.
 
 ```bash
-PYTHONPATH="$UNI_AGENT:$UPSTREAM_VERL" python -m pytest -q \
-  tests/uni_agent/gateway tests/uni_agent/framework -m 'not level1'
+# Run from this repository with the companion verl importable.
+python -m pytest -q tests/uni_agent/gateway tests/uni_agent/framework -m 'not level1'
 
-# The optimizer checks can also run against the existing MiMo verl checkout.
-PYTHONPATH="$MIMO_VERL" python -c '
-import runpy
-checks = runpy.run_path("tests/uni_agent/framework/test_rollout_grouping.py")
-for name, check in checks.items():
-    if name.startswith("test_"):
-        check()
-'
+# Run from the companion verl checkout.
+python -m pytest -q \
+  tests/trainer/test_multi_trajectories_advantage_on_cpu.py \
+  tests/trainer/ppo/test_loss_aggregation_on_cpu.py \
+  tests/trainer/ppo/test_rollout_corr.py \
+  tests/trainer/ppo/test_rollout_corr_integration.py \
+  tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py \
+  tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py \
+  tests/utils/test_padding_on_cpu.py
 ```
-
-### Results
-
-| Frozen Uni-Agent code | Scope | Result |
-| --- | --- | --- |
-| `9c8a211` | Gateway and framework suites with `-m 'not level1'`, including native HTTP/SSE and real Ray gateway tests | 716 passed, 9 skipped, 17 deselected |
-| `eff394c29630e1258b7996aa6ecc2767940fa087` | Same selection after the final context-boundary span fix, excluding `test_gateway_actor_on_cpu.py` and `test_gateway_manager_on_cpu.py` | 634 passed, 9 skipped, 17 deselected |
-| Existing MiMo verl `79090e58` | Standalone native grouped-GRPO, gradient-mask and token-importance checks | 2 passed |
-| Final Python changes | Ruff, compilation and whitespace checks | Passed |
-
-The final delta after `9c8a211` clips generation spans when native context merging
-replaces a generated suffix, and adds two regression cases using native metadata
-alignment. All affected codec, session and framework suites were rerun on
-`eff394c`; the unchanged HTTP/Ray test coverage is reused from `9c8a211`.
-The following documentation commit does not change executable code.
-
-The nine skips are three optional `qwen_vl_utils` cases and six optional
-`vllm.parser.qwen3` cases. SGLang payload/API-error distinctions are covered with
-parser fixtures; a live SGLang parser/model deployment is not validated. The
-17 `level1` cases (provider tunnel checks and live worker-ready probes) are outside
-the selected regression scope. No test failure remains in the selected scopes.
-
-This branch is ready for consuming-project integration work, not a direct
-replacement for the existing MiMo verl/runner combination. Coordinate the verl
-API upgrade, migrate runner and audit consumers, then validate the actual model,
-Codex compaction and training service before switching production dependencies.
