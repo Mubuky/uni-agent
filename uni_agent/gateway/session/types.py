@@ -57,6 +57,7 @@ class SessionHandle:
 
     session_id: str
     base_url: str | None = None
+    activity_url: str | None = None
 
 
 @dataclass
@@ -90,6 +91,9 @@ class Trajectory:
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
+    generation_spans: list[tuple[int, int]] = field(default_factory=list)
+    messages: list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
     response_logprobs: list[float] | None = None
     finished: bool | None = None
     reward_score: float | None = None

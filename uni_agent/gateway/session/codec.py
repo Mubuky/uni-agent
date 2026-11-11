@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -22,6 +23,9 @@ from verl.utils.tokenizer.continuous_token import MergeResult, VLContinuousToken
 from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
 
 # Map backend stop_reason values into the gateway's internal finish_reason vocabulary.
+_FREEFORM_PROBE_NAME = "__uni_agent_freeform_probe__"
+_FREEFORM_PROBE_BODY = "__uni_agent_freeform_body__"
+
 _FINISH_REASON_MAP = {
     "completed": "stop",
     "stop": "stop",
@@ -140,6 +144,100 @@ def _normalize_messages_for_continuous_tokens(
     ]
 
 
+def _split_generation_thinking(text: str, *, prompt_opens_thinking: bool) -> tuple[str | None, str]:
+    """Normalize model text when a chat template owns the think opening tag.
+
+    Qwen3.5 appends ``<think>`` to the generation prompt, so its completion
+    starts with reasoning and normally contains only ``</think>``. Other
+    templates (including MiMo-V2) leave both tags to the model. Keep this
+    helper model-agnostic and fail open on malformed output so no generated
+    text is silently discarded.
+    """
+    if not isinstance(text, str) or not text:
+        return None, text or ""
+
+    if prompt_opens_thinking:
+        opening = "<think>"
+        if text.startswith(opening):
+            text = text[len(opening) :]
+        close = text.find("</think>")
+        if close < 0:
+            return None, text
+        reasoning = text[:close].rstrip("\n")
+        content = text[close + len("</think>") :].lstrip("\n")
+        return reasoning or None, content
+
+    if text.startswith("<think>"):
+        close = text.find("</think>", len("<think>"))
+        if close < 0:
+            return None, text
+        reasoning = text[len("<think>") : close].strip("\n")
+        content = text[close + len("</think>") :].lstrip("\n")
+        return reasoning or None, content
+    return None, text
+
+
+def _canonicalize_tool_arguments_for_comparison(arguments: Any) -> tuple[str, Any]:
+    if isinstance(arguments, dict | list):
+        canonical: tuple[str, Any] = ("json", arguments)
+    elif isinstance(arguments, str):
+        try:
+            canonical = ("json", json.loads(arguments))
+        except json.JSONDecodeError:
+            canonical = ("raw", arguments)
+    else:
+        canonical = ("raw", arguments)
+
+    if canonical[0] == "json" and isinstance(canonical[1], dict) and set(canonical[1]) == {"input"}:
+        return _canonicalize_tool_arguments_for_comparison(canonical[1]["input"])
+    return canonical
+
+
+def _supports_freeform_tool_calls(processing_class) -> bool:
+    """Probe whether the active Jinja renders ``tool_call.input`` verbatim."""
+    probe = [
+        {"role": "user", "content": "__uni_agent_probe_user__"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"name": _FREEFORM_PROBE_NAME, "input": _FREEFORM_PROBE_BODY}],
+        },
+    ]
+    try:
+        rendered = processing_class.apply_chat_template(
+            probe,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        return False
+    return f"<function={_FREEFORM_PROBE_NAME}>{_FREEFORM_PROBE_BODY}</function>" in rendered
+
+
+def _freeform_call_input(arguments: Any) -> str:
+    """Unwrap the internal ``{"input": raw}`` envelope for v2.6 Jinja."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return arguments
+    if isinstance(arguments, dict) and len(arguments) == 1 and isinstance(arguments.get("input"), str):
+        return arguments["input"]
+    if isinstance(arguments, str):
+        return arguments
+    return json.dumps(arguments, ensure_ascii=False) if arguments is not None else ""
+
+
+def _tool_name(tool: Any) -> str | None:
+    if not isinstance(tool, dict):
+        return None
+    if isinstance(tool.get("function"), dict):
+        name = tool["function"].get("name")
+        return str(name) if name else None
+    name = tool.get("name") or tool.get("type")
+    return str(name) if name else None
+
+
 class MessageCodec:
     """Model-scoped request codec used by gateway sessions.
 
@@ -184,6 +282,7 @@ class MessageCodec:
             processor=processor,
         )
         self._processor = processor
+        self._freeform_tool_calls = _supports_freeform_tool_calls(processor if processor is not None else tokenizer)
         self._vision_info_extractor = vision_info_extractor or self._default_vision_info_extractor
         self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
         processing_class = processor if processor is not None else tokenizer
@@ -203,6 +302,8 @@ class MessageCodec:
                 processing_class,
                 **self._apply_chat_template_kwargs,
             )
+        prompt_text = tokenizer.decode(self._generation_prompt, skip_special_tokens=False)
+        self._generation_prompt_opens_thinking = "<think>" in prompt_text and "</think>" not in prompt_text
         self._tool_parser_name = tool_parser_name
         self._rollout_backend = rollout_backend
         self._enable_tool_parser_cache = enable_tool_parser_cache
@@ -272,6 +373,38 @@ class MessageCodec:
             extractor_kwargs["image_patch_size"] = self._processor.image_processor.patch_size
         return await self._vision_info_extractor(messages, **extractor_kwargs)
 
+    def model_tools_for(self, tools):
+        if tools is None:
+            return None
+        return [
+            tool["custom"]
+            if self._freeform_tool_calls and "custom" in tool
+            else {key: value for key, value in tool.items() if key != "custom"}
+            for tool in tools
+        ]
+
+    def model_messages_for(self, messages, tools):
+        custom_names = {_tool_name(tool) for tool in tools or [] if "custom" in tool}
+        if not self._freeform_tool_calls or not custom_names:
+            return messages
+        result = []
+        for message in messages:
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                result.append(message)
+                continue
+            projected = []
+            for call in calls:
+                function = call.get("function") or {}
+                if function.get("name") in custom_names:
+                    projected.append(
+                        {"name": function["name"], "input": _freeform_call_input(function.get("arguments"))}
+                    )
+                else:
+                    projected.append(call)
+            result.append({**message, "tool_calls": projected})
+        return result
+
     def build_initial_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -281,8 +414,8 @@ class MessageCodec:
     ) -> list[int]:
         """Build the initial runtime token stream."""
         return self._continuous_token_builder.build_initial_tokens(
-            _normalize_messages_for_continuous_tokens(messages),
-            tools=tools,
+            _normalize_messages_for_continuous_tokens(self.model_messages_for(messages, tools)),
+            tools=self.model_tools_for(tools),
             images=image_data,
             videos=video_data,
         )
@@ -354,6 +487,9 @@ class MessageCodec:
             raise UnsupportedMediaError(
                 "Continuous Token context merging does not currently support incremental video data"
             )
+        previous_messages = self.model_messages_for(previous_messages, tools)
+        updated_messages = self.model_messages_for(updated_messages, tools)
+        tools = self.model_tools_for(tools)
         force_system_anchor = any(message.get("role") == "system" for message in previous_messages) and not any(
             message.get("role") == "user" for message in previous_messages
         )
@@ -496,7 +632,20 @@ class MessageCodec:
         tools: list[dict[str, Any]],
         parser_name: str,
     ) -> tuple[str, list[Any]]:
+        tools = [{key: value for key, value in tool.items() if key != "custom"} for tool in tools]
         text = self._tokenizer.decode(response_ids, skip_special_tokens=False)
+        pattern = r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>"
+        blocks = list(re.finditer(pattern, text, re.DOTALL))
+        if any(match[2].strip() and "<parameter=" not in match[2] for match in blocks):
+            calls = []
+            for match in blocks:
+                if match[2].strip() and "<parameter=" not in match[2]:
+                    calls.append(SimpleNamespace(name=match[1].strip(), arguments=match[2], raw_arguments=True))
+                else:
+                    ids = self._tokenizer.encode(match[0], add_special_tokens=False)
+                    _, parsed = await self._extract_tool_calls(ids, tools, parser_name)
+                    calls.extend(parsed)
+            return re.sub(pattern, "", text, flags=re.DOTALL), calls
         parser_backend = self._rollout_backend if self._rollout_backend in {"sglang", "vllm"} else "verl"
 
         try:
@@ -531,20 +680,35 @@ class MessageCodec:
                         "type": "function",
                         "function": {
                             "name": fc.name,
-                            "arguments": normalize_tool_arguments(fc.arguments),
+                            "arguments": fc.arguments
+                            if getattr(fc, "raw_arguments", False)
+                            else normalize_tool_arguments(fc.arguments),
                         },
                     }
                     for fc in function_calls
                 ]
+                reasoning, visible = _split_generation_thinking(
+                    self._strip_trailing_stop_token(content or ""),
+                    prompt_opens_thinking=self._generation_prompt_opens_thinking,
+                )
                 message = {
                     "role": "assistant",
-                    "content": content or "",
+                    "content": visible,
                     "tool_calls": tool_calls,
                 }
-                return message, "tool_calls"
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+                return message, "length" if _FINISH_REASON_MAP.get(stop_reason) == "length" else "tool_calls"
         response_text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
         finish_reason = _FINISH_REASON_MAP.get(stop_reason, stop_reason) if stop_reason else "stop"
-        return {"role": "assistant", "content": response_text}, finish_reason
+        reasoning, visible = _split_generation_thinking(
+            response_text,
+            prompt_opens_thinking=self._generation_prompt_opens_thinking,
+        )
+        message = {"role": "assistant", "content": visible}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        return message, finish_reason
 
     def canonicalize_message_for_prefix_comparison(self, message: dict[str, Any]) -> dict[str, Any]:
         """Canonicalize one message before session prefix comparison."""
@@ -558,6 +722,22 @@ class MessageCodec:
         for tool_call in tool_calls:
             normalized_tool_call = dict(tool_call)
             normalized_tool_call.pop("id", None)
+            normalized_tool_call["type"] = "function"
+            function = normalized_tool_call.get("function")
+            if isinstance(function, dict) and "arguments" in function:
+                normalized_function = dict(function)
+                normalized_function["arguments"] = _canonicalize_tool_arguments_for_comparison(function["arguments"])
+                normalized_tool_call["function"] = normalized_function
             normalized_tool_calls.append(normalized_tool_call)
         normalized["tool_calls"] = normalized_tool_calls
         return normalized
+
+    def _strip_trailing_stop_token(self, content: str) -> str:
+        """Remove terminal EOS text from the visible tool-call content."""
+        eos = getattr(self._tokenizer, "eos_token", None)
+        if not isinstance(eos, str) or not eos.strip():
+            return content
+        stripped = content.rstrip()
+        while stripped.endswith(eos):
+            stripped = stripped[: -len(eos)].rstrip()
+        return stripped if stripped != content.rstrip() else content

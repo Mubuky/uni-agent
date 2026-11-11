@@ -9,6 +9,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from functools import wraps
 from typing import Any
 
 from fastapi import HTTPException
@@ -31,6 +32,20 @@ _TRAJECTORY_CAPACITY_HINT = (
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS alone will not help. Check the rollout prompt_length/response_length "
     "budget or compact context earlier; the episode may be unfinished."
 )
+
+
+def track_activity(generate):
+    @wraps(generate)
+    async def tracked(self, *args, **kwargs):
+        self._activity_requests += 1
+        self._touch()
+        try:
+            return await generate(self, *args, **kwargs)
+        finally:
+            self._activity_requests -= 1
+            self._touch()
+
+    return tracked
 
 
 class SessionPhase(str, Enum):
@@ -75,6 +90,7 @@ class TrajectoryBuffer:
     response_logprobs: list[float] = field(default_factory=list)
     routed_experts: Any | None = None
     generation_versions: list[tuple[int | None, int | None]] = field(default_factory=list)
+    generation_spans: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -246,12 +262,15 @@ class GatewaySession:
         self.created_at = time.time()
         self.updated_at = self.created_at
         self.request_lock = asyncio.Lock()
+        self.agent_finished = False
+        self._activity_requests = 0
 
     @property
     def sampling_params(self) -> dict[str, Any]:
         """Return a copy of the trusted per-session sampling defaults."""
         return dict(self._sampling_params)
 
+    @track_activity
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Run one provider-normalized generation request and return its business outcome.
 
@@ -396,6 +415,14 @@ class GatewaySession:
             encoded.buffer.response_ids = list(merged_token_ids[prompt_length:])
             encoded.buffer.response_mask = list(response_mask)
             encoded.buffer.response_logprobs = list(response_logprobs or [])
+            generation_end = len(encoded.buffer.response_ids)
+            generation_start = generation_end - len(response_ids)
+            encoded.buffer.generation_spans = [
+                (start, min(end, generation_start))
+                for start, end in encoded.buffer.generation_spans
+                if start < generation_start
+            ]
+            encoded.buffer.generation_spans.append((generation_start, generation_end))
             encoded.buffer.generation_versions.append(
                 (
                     output.extra_fields.get("min_global_steps"),
@@ -521,22 +548,43 @@ class GatewaySession:
             ]
             return ordered_trajectories
 
-    async def abort(self) -> None:
+    async def abort(self) -> list[Trajectory]:
         """Abort the session and prevent further generation."""
         async with self.request_lock:
             if self.phase == SessionPhase.ABORTED:
-                return
+                return []
             if self.phase == SessionPhase.FINALIZED:
                 raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            self._materialize_active_chains()
+            snapshots = [chain.trajectory for chain in sorted(self.materialized_chains, key=lambda c: c.order_seq)]
             self.phase = SessionPhase.ABORTED
             self.active_chains = []
             self.materialized_chains = []
             self.reserved_chain_ids.clear()
             self._touch()
+            return snapshots
+
+    def activity_state(self):
+        pending = sorted(
+            {
+                str(call["id"])
+                for chain in self.active_chains
+                for call in chain.message_history[-1].get("tool_calls", [])
+                if chain.message_history and call.get("id")
+            }
+        )
+        return {
+            "in_flight_requests": self._activity_requests,
+            "agent_finished": self.agent_finished,
+            "pending_tool_call_ids": pending,
+            "awaiting_external_followup": bool(pending) and not self.agent_finished,
+            "awaiting_external_followup_seconds": max(0.0, time.time() - self.updated_at) if pending else None,
+        }
 
     def snapshot_state(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot for actor state inspection."""
         return {
+            **self.activity_state(),
             "session_id": self.handle.session_id,
             "phase": self.phase.value,
             "created_at": self.created_at,
@@ -593,6 +641,7 @@ class GatewaySession:
                 # One generation appends exactly one mark, so the rewritten
                 # assistant is always the last one.
                 del buffer.generation_versions[-1:]
+                del buffer.generation_spans[-1:]
 
                 if image_data is not None:
                     assert last_assistant_start.image_data_len <= len(image_data)
@@ -666,6 +715,11 @@ class GatewaySession:
                 buffer.response_ids = list(merged_token_ids[prompt_length:])
                 buffer.response_mask = list(merged_response_mask)
                 buffer.response_logprobs = list(merged_response_logprobs or [])
+                buffer.generation_spans = [
+                    (start, min(end, len(buffer.response_ids)))
+                    for start, end in buffer.generation_spans
+                    if start < len(buffer.response_ids)
+                ]
                 self._assert_response_logprob_alignment(buffer)
                 if appended_images:
                     if image_data is None:
@@ -852,6 +906,7 @@ class GatewaySession:
             response_logprobs=list(buffer.response_logprobs),
             routed_experts=buffer.routed_experts,
             generation_versions=list(buffer.generation_versions),
+            generation_spans=list(buffer.generation_spans),
         )
 
     def _copy_chain_media(self, chain: ChainState) -> tuple[list[Any] | None, list[Any] | None]:
@@ -1034,6 +1089,9 @@ class GatewaySession:
         if mm_processor_kwargs:
             trajectory_extra_fields["mm_processor_kwargs"] = mm_processor_kwargs
         return Trajectory(
+            generation_spans=list(chain.buffer.generation_spans),
+            messages=list(chain.message_history),
+            tools=chain.active_tool_schemas,
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),
             response_mask=list(chain.buffer.response_mask),

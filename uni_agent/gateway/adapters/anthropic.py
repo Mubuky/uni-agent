@@ -80,12 +80,10 @@ def _tool_call_input(arguments: Any) -> dict[str, Any]:
 
 def _outcome_to_blocks(assistant_msg: dict[str, Any]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
-    # Outbound thinking/reasoning is intentionally not synthesized here:
-    # `assistant_msg` from session/decode currently has no `reasoning_content`
-    # field, and adding outbound wrapping before there is a producer would be
-    # defensive code at a trusted boundary (AGENTS §4 rule 3). When session
-    # decode grows reasoning_content, mirror OpenAI streaming and emit Anthropic
-    # thinking blocks at that point.
+    reasoning = assistant_msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+
     content = assistant_msg.get("content")
     if isinstance(content, str) and content:
         blocks.append({"type": "text", "text": content})
@@ -107,7 +105,7 @@ def _outcome_to_blocks(assistant_msg: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
 
-    if not blocks:
+    if all(block["type"] == "thinking" for block in blocks):
         blocks.append({"type": "text", "text": ""})
     return blocks
 
@@ -157,14 +155,22 @@ def anthropic_stream_response(outcome: GenerationOutcome, *, model: str) -> Stre
             },
         )
         for idx, block in enumerate(blocks):
-            if block["type"] == "text":
+            deltas: list[dict[str, Any]]
+            if block["type"] == "thinking":
+                start = {"type": "thinking", "thinking": "", "signature": ""}
+                deltas = [
+                    {"type": "thinking_delta", "thinking": block["thinking"]},
+                    {"type": "signature_delta", "signature": block["signature"]},
+                ]
+            elif block["type"] == "text":
                 start = {"type": "text", "text": ""}
-                delta = {"type": "text_delta", "text": block["text"]}
+                deltas = [{"type": "text_delta", "text": block["text"]}]
             else:
                 start = {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}
-                delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"], ensure_ascii=False)}
+                deltas = [{"type": "input_json_delta", "partial_json": json.dumps(block["input"], ensure_ascii=False)}]
             yield _event("content_block_start", {"type": "content_block_start", "index": idx, "content_block": start})
-            yield _event("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": delta})
+            for delta in deltas:
+                yield _event("content_block_delta", {"type": "content_block_delta", "index": idx, "delta": delta})
             yield _event("content_block_stop", {"type": "content_block_stop", "index": idx})
         yield _event(
             "message_delta",
@@ -330,6 +336,7 @@ def _assistant_message_from_content(content: Any) -> dict[str, Any]:
         raise MalformedRequestError("assistant content must be a string or block list")
 
     texts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     for block in content:
         if not isinstance(block, dict):
@@ -358,12 +365,11 @@ def _assistant_message_from_content(content: Any) -> dict[str, Any]:
                 }
             )
         elif block_type == "thinking":
-            # Self-hosted SGLang never emits Anthropic thinking blocks, so seeing
-            # one in inbound history means the client mixed sources. Drop with a
-            # warning rather than crash; <think>...</think> tokens, if present,
-            # are already preserved as plain text on the same assistant message.
-            logger.warning("Dropping Anthropic thinking block from assistant history; multi-turn prefix may drift")
-            continue
+            thinking = block.get("thinking", "")
+            if not isinstance(thinking, str):
+                raise MalformedRequestError("thinking.thinking must be a string")
+            if thinking:
+                reasoning_parts.append(thinking)
         elif block_type == "redacted_thinking":
             # Anthropic-encrypted reasoning signature with byte-level fidelity;
             # no faithful representation in our chat-template path, and silently
@@ -373,6 +379,8 @@ def _assistant_message_from_content(content: Any) -> dict[str, Any]:
             raise MalformedRequestError(f"Unsupported assistant block type: {block_type}")
 
     message: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts)}
+    if reasoning_parts:
+        message["reasoning_content"] = "\n".join(reasoning_parts)
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message

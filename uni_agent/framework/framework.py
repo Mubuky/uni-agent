@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import time
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -34,6 +35,13 @@ from verl.utils.transferqueue_utils import tq
 
 from .base import AgentFramework
 from .multi_modal_postprocess import compute_multi_modal_inputs, compute_position_ids
+from .trajectory_signals import (
+    _normalize_repetition_detect_config,
+    _repetition_mask,
+    _tool_call_error_mask,
+    _turn_index,
+    annotate_repetition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +57,7 @@ class _RunnerConfig:
     max_concurrent_sessions: int
     trajectory_selection: str = "all"
     session_timeout_seconds: float | None = None
+    agent_request_idle_timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if not self.runner_fqn:
@@ -59,6 +68,8 @@ class _RunnerConfig:
             raise ValueError(f"max_concurrent_sessions must be non-negative, got {self.max_concurrent_sessions}")
         if self.trajectory_selection not in {"all", "longest"}:
             raise ValueError(f"Unknown trajectory selection: {self.trajectory_selection}. Expected 'all' or 'longest'")
+        if self.agent_request_idle_timeout_seconds is not None and self.agent_request_idle_timeout_seconds <= 0:
+            raise ValueError("agent_request_idle_timeout_seconds must be positive")
         if self.session_timeout_seconds is not None and self.session_timeout_seconds <= 0:
             raise ValueError(f"session_timeout_seconds must be positive, got {self.session_timeout_seconds}")
 
@@ -89,6 +100,7 @@ class _RunnerConfig:
                 max_concurrent_sessions=max_concurrent_sessions,
                 trajectory_selection=trajectory_selection,
                 session_timeout_seconds=session_timeout_seconds,
+                agent_request_idle_timeout_seconds=runner_cfg.get("agent_request_idle_timeout_seconds"),
             )
         except ValueError as exc:
             raise ValueError(f"agent_runners.{runner_name}: {exc}") from exc
@@ -181,6 +193,9 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "rollout_log_probs",
     "routed_experts",
     "rm_scores",
+    "tool_call_error_mask",
+    "repetition_mask",
+    "turn_index",
     "teacher_logprobs",
     "teacher_ids",
 }
@@ -309,6 +324,17 @@ def _trajectory_to_reward_dataproto(trajectory, sample_fields, task_result: Task
     return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
 
+class AgentRequestTimeout(asyncio.TimeoutError):
+    """The external agent stopped sending requests after a model tool call."""
+
+    def __init__(self, *, idle_seconds: float, pending_tool_call_ids: list[str]):
+        self.idle_seconds = idle_seconds
+        self.pending_tool_call_ids = list(pending_tool_call_ids)
+        super().__init__(
+            f"agent sent no follow-up request for {idle_seconds:.1f}s after tool calls {self.pending_tool_call_ids}"
+        )
+
+
 class GatewayAgentFramework(AgentFramework):
     """Reference AgentFramework implementation for Gateway-backed agent loops.
 
@@ -325,6 +351,7 @@ class GatewayAgentFramework(AgentFramework):
     #: ray.cancel (letting its sandbox context manager tear down) before the
     #: framework escalates to a force-kill.
     _RUNNER_CANCEL_GRACE_SECONDS = 30.0
+    _RUNNER_ACTIVITY_POLL_SECONDS = 5.0
 
     def __init__(
         self,
@@ -337,6 +364,8 @@ class GatewayAgentFramework(AgentFramework):
         rollout_config=None,
         log_dir: str | None = None,
         mask_unfinished_episode: bool = False,
+        repetition_detect: dict | None = None,
+        ship_turn_index: bool = False,
         trajectory_postprocessor: TrajectoryPostprocessor | None = None,
         trajectory_postprocessor_kwargs: dict[str, object] | None = None,
     ):
@@ -359,6 +388,10 @@ class GatewayAgentFramework(AgentFramework):
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._log_dir = log_dir
         self._mask_unfinished_episode = mask_unfinished_episode
+        self._repetition_detect = _normalize_repetition_detect_config(repetition_detect)
+        if type(ship_turn_index) is not bool:
+            raise ValueError("ship_turn_index must be a bool")
+        self._ship_turn_index = ship_turn_index
         self._trajectory_postprocessor = trajectory_postprocessor
         self._trajectory_postprocessor_kwargs = trajectory_postprocessor_kwargs or {}
 
@@ -445,6 +478,8 @@ class GatewayAgentFramework(AgentFramework):
             trajectory_postprocessor_kwargs = dict(postprocessor_kwargs)
 
         return {
+            "repetition_detect": af_cfg.get("repetition_detect"),
+            "ship_turn_index": af_cfg.get("ship_turn_index", False),
             "runner_registry": runner_registry,
             "custom_reward_function_configured": custom_reward_function_path is not None,
             "rollout_config": config.actor_rollout_ref.rollout,
@@ -873,9 +908,11 @@ class GatewayAgentFramework(AgentFramework):
                     # unwinds and its sandbox context manager tears down cleanly;
                     # force-kill only if it ignores the cancel.
                     try:
-                        task_result = await asyncio.wait_for(
+                        task_result = await self._wait_for_runner_task(
                             object_ref,
-                            timeout=runner_config.session_timeout_seconds,
+                            session_id=session_id,
+                            session_timeout_seconds=runner_config.session_timeout_seconds,
+                            request_idle_timeout_seconds=runner_config.agent_request_idle_timeout_seconds,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         await self._cancel_runner_task(object_ref, session_id)
@@ -910,7 +947,9 @@ class GatewayAgentFramework(AgentFramework):
                 raise
             except Exception:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
-                await self.gateway_manager.abort_session(session_id)
+                partial = await self.gateway_manager.abort_session(session_id)
+                if run_dir is not None:
+                    await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, partial or [])
                 session_trace.finish(
                     runner_name=runner_name,
                     status="failure",
@@ -967,6 +1006,7 @@ class GatewayAgentFramework(AgentFramework):
                 ]
 
             result_trajectories = _attach_runner_reward_info(result_trajectories, task_result)
+            result_trajectories = annotate_repetition(result_trajectories, self._repetition_detect)
 
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
@@ -979,6 +1019,65 @@ class GatewayAgentFramework(AgentFramework):
                 finished=result_trajectories[0].finished if result_trajectories else None,
             )
             return result_trajectories, sample_fields
+
+    async def _wait_for_runner_task(
+        self,
+        object_ref,
+        *,
+        session_id: str,
+        session_timeout_seconds: float | None,
+        request_idle_timeout_seconds: float | None,
+    ):
+        """Wait for a Ray runner with separate wall and external-request idle budgets."""
+        if session_timeout_seconds is None and request_idle_timeout_seconds is None:
+            return await object_ref
+
+        runner_wait_task = asyncio.ensure_future(asyncio.shield(object_ref))
+        started_at = time.monotonic()
+        try:
+            while not runner_wait_task.done():
+                remaining_wall = (
+                    session_timeout_seconds - (time.monotonic() - started_at)
+                    if session_timeout_seconds is not None
+                    else None
+                )
+                if remaining_wall is not None and remaining_wall <= 0:
+                    raise asyncio.TimeoutError(f"session exceeded wall timeout of {session_timeout_seconds:.1f}s")
+
+                wait_seconds = self._RUNNER_ACTIVITY_POLL_SECONDS
+                if remaining_wall is not None:
+                    wait_seconds = min(wait_seconds, remaining_wall)
+                if request_idle_timeout_seconds is not None:
+                    wait_seconds = min(wait_seconds, request_idle_timeout_seconds)
+                done, _ = await asyncio.wait({runner_wait_task}, timeout=wait_seconds)
+                if done:
+                    break
+
+                if request_idle_timeout_seconds is None:
+                    continue
+                try:
+                    state = await self.gateway_manager.get_session_state(session_id)
+                except Exception:
+                    logger.warning("session %s: failed to inspect request-idle state", session_id, exc_info=True)
+                    continue
+                if runner_wait_task.done() or int(state.get("in_flight_requests", 0)) > 0:
+                    continue
+                if state.get("agent_finished"):
+                    continue
+                idle_seconds = state.get("awaiting_external_followup_seconds")
+                if not state.get("awaiting_external_followup") or idle_seconds is None:
+                    continue
+                idle_seconds = float(idle_seconds)
+                if idle_seconds >= request_idle_timeout_seconds:
+                    raise AgentRequestTimeout(
+                        idle_seconds=idle_seconds,
+                        pending_tool_call_ids=[str(value) for value in state.get("pending_tool_call_ids", [])],
+                    )
+
+            return await runner_wait_task
+        finally:
+            if not runner_wait_task.done():
+                runner_wait_task.cancel()
 
     async def _cancel_runner_task(self, object_ref, session_id: str) -> None:
         """Cancel a dispatched runner Ray task after its session timed out.
@@ -1097,12 +1196,32 @@ class GatewayAgentFramework(AgentFramework):
                 arrays[f"traj{i}_prompt_ids"] = np.asarray(traj.prompt_ids, dtype=np.int32)
                 arrays[f"traj{i}_response_ids"] = np.asarray(traj.response_ids, dtype=np.int32)
                 arrays[f"traj{i}_response_mask"] = np.asarray(traj.response_mask, dtype=np.int8)
+                arrays[f"traj{i}_generation_spans"] = np.asarray(traj.generation_spans, dtype=np.int64).reshape(-1, 2)
                 if traj.response_logprobs is not None:
                     arrays[f"traj{i}_response_logprobs"] = np.asarray(traj.response_logprobs, dtype=np.float32)
 
             buf = io.BytesIO()
             np.savez_compressed(buf, **arrays)
             (run_dir / "trajectory.npz").write_bytes(buf.getvalue())
+            (run_dir / "transcript.json").write_text(
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "trajectories": [
+                            {
+                                "messages": t.messages,
+                                "tools": t.tools,
+                                "runner_reward_info": t.extra_fields.get("runner_reward_info"),
+                                "reward_score": t.reward_score,
+                            }
+                            for t in trajectories
+                        ],
+                    },
+                    ensure_ascii=False,
+                    default=_json_default,
+                ),
+                encoding="utf-8",
+            )
         except Exception:
             logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
 
@@ -1110,6 +1229,7 @@ class GatewayAgentFramework(AgentFramework):
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""
         extra = traj.extra_fields or {}
         return {
+            "generation_spans": [list(span) for span in traj.generation_spans],
             "num_turns": traj.num_turns,
             "finished": traj.finished,
             "reward_score": traj.reward_score,
@@ -1281,6 +1401,13 @@ class GatewayAgentFramework(AgentFramework):
         # Framework-owned masks must win over same-named Gateway extra fields.
         field["response_mask"] = response_mask
         field["loss_mask"] = response_mask
+        field["tool_call_error_mask"], error_alignment, _ = _tool_call_error_mask(trajectory)
+        field["repetition_mask"], repetition_alignment, _ = _repetition_mask(trajectory)
+        field["extra_fields"]["tool_call_error_alignment"] = error_alignment
+        field["extra_fields"]["repetition_alignment"] = repetition_alignment
+        if self._ship_turn_index:
+            field["turn_index"], alignment = _turn_index(trajectory)
+            field["extra_fields"]["turn_index_alignment"] = alignment
         field.pop("multi_modal_data", None)
         for key in (
             "uid",

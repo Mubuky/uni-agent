@@ -16,7 +16,13 @@ from typing import Any
 from fastapi import HTTPException
 
 from uni_agent.gateway.session.codec import MessageCodec
-from uni_agent.gateway.session.session import GatewaySession, GenerationOutcome, InflightRequest, SessionPhase
+from uni_agent.gateway.session.session import (
+    GatewaySession,
+    GenerationOutcome,
+    InflightRequest,
+    SessionPhase,
+    track_activity,
+)
 from uni_agent.gateway.session.types import (
     AgentContext,
     InternalGenerationRequest,
@@ -135,6 +141,7 @@ class TreeGatewaySession(GatewaySession):
         log_dir = self._metadata.get("_log_dir")
         self._storage_path = Path(log_dir) / "trajectory_tree.pkl" if log_dir else None
 
+    @track_activity
     async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
         """Coalesce identical requests and overlap backend calls within the session."""
         agent_context = request["agent_context"].copy() if request.get("agent_context") is not None else None
@@ -396,12 +403,16 @@ class TreeGatewaySession(GatewaySession):
             self._touch()
             return trajectories
 
-    async def abort(self) -> None:
+    async def abort(self) -> list[Trajectory]:
         async with self.request_lock:
             if self.phase == SessionPhase.ABORTED:
-                return
+                return []
             if self.phase == SessionPhase.FINALIZED:
                 raise RuntimeError(f"Session {self.handle.session_id} is finalized")
+            snapshots = [
+                leaf if isinstance(leaf, Trajectory) else self._linearize_path(self._path_from_root(leaf))
+                for leaf in self.leaves.values()
+            ]
             storage_path = self._storage_path
             try:
                 if storage_path is not None and self.root is not None:
@@ -418,11 +429,13 @@ class TreeGatewaySession(GatewaySession):
             self._clear_tree()
             self.phase = SessionPhase.ABORTED
             self._touch()
+            return snapshots
 
     def snapshot_state(self) -> dict[str, Any]:
         """Read in-memory metadata without waiting for locks or performing I/O."""
         chain_ids = sorted(chain_id for chain_id, leaf in self.leaves.items() if isinstance(leaf, MessageNode))
         return {
+            **self.activity_state(),
             "session_id": self.handle.session_id,
             "phase": self.phase.value,
             "created_at": self.created_at,
@@ -816,6 +829,7 @@ class TreeGatewaySession(GatewaySession):
         leaf = path[-1]
         chain_start = next(index for index, node in enumerate(path) if node.chain_id == leaf.chain_id)
         prompt_ids = list(path[0].prompt_ids)
+        generation_spans: list[tuple[int, int]] = []
         response_ids: list[int] = []
         response_mask: list[int] = []
         response_logprobs: list[float | None] | None = [] if leaf.response_logprobs is not None else None
@@ -825,6 +839,9 @@ class TreeGatewaySession(GatewaySession):
                     del prompt_ids[-(node.removed_prefix_token_count - len(response_ids)) :]
                 del response_ids[-node.removed_prefix_token_count :]
                 del response_mask[-node.removed_prefix_token_count :]
+                generation_spans = [
+                    (start, min(end, len(response_ids))) for start, end in generation_spans if start < len(response_ids)
+                ]
                 if response_logprobs is not None:
                     del response_logprobs[-node.removed_prefix_token_count :]
             if index:
@@ -835,10 +852,12 @@ class TreeGatewaySession(GatewaySession):
             if index == chain_start:
                 # History owned by another chain is this chain's initial prompt.
                 prompt_ids.extend(response_ids)
+                generation_spans.clear()
                 response_ids.clear()
                 response_mask.clear()
                 if response_logprobs is not None:
                     response_logprobs.clear()
+            generation_spans.append((len(response_ids), len(response_ids) + len(node.response_ids)))
             response_ids.extend(node.response_ids)
             response_mask.extend(repeat(1, len(node.response_ids)))
             if response_logprobs is not None:
@@ -883,6 +902,9 @@ class TreeGatewaySession(GatewaySession):
             extra_fields["rollback_count"] = leaf.rollback_count
             extra_fields["rollback_dropped_trainable_tokens_total"] = leaf.rollback_dropped_trainable_tokens_total
         return Trajectory(
+            generation_spans=generation_spans,
+            messages=self._path_messages(path),
+            tools=self._copy_tools(self.tool_schemas_by_fingerprint.get(leaf.tools_fingerprint)),
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,

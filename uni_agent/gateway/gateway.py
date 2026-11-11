@@ -204,6 +204,18 @@ class _GatewayActor:
                 session_id=session_id, payload=payload, agent_context=agent_context_from_headers(request.headers)
             )
 
+        @self._app.post("/sessions/{session_id}/activity")
+        async def _activity(session_id: str, request: Request):
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="Unknown session_id")
+            payload = await request.json()
+            if not isinstance(payload, dict) or type(payload.get("agent_finished")) is not bool:
+                raise HTTPException(status_code=400, detail="agent_finished must be a bool")
+            session.agent_finished = payload["agent_finished"]
+            session._touch()
+            return {"agent_finished": session.agent_finished}
+
         @self._app.post("/sessions/{session_id}/v1/responses")
         async def _openai_responses(session_id: str, request: Request):
             try:
@@ -402,6 +414,7 @@ class _GatewayActor:
         handle = SessionHandle(
             session_id=session_id,
             base_url=f"{self._server_base_url}/sessions/{session_id}/v1",
+            activity_url=f"{self._server_base_url}/sessions/{session_id}/activity",
         )
         session_cls = TreeGatewaySession if config.use_tree_trajectory_manager else GatewaySession
         self._sessions[session_id] = session_cls(
@@ -425,14 +438,15 @@ class _GatewayActor:
         self._session_policies.pop(session_id, None)
         return trajectories
 
-    async def abort_session(self, session_id: str) -> None:
+    async def abort_session(self, session_id: str) -> list[Trajectory]:
         """Abort a session and remove it from the actor if it still exists."""
         session = self._sessions.get(session_id)
         if session is None:
-            return  # Already finalized or aborted — treat as idempotent.
-        await session.abort()
+            return []  # Already finalized or aborted — treat as idempotent.
+        snapshots = await session.abort()
         self._sessions.pop(session_id, None)
         self._session_policies.pop(session_id, None)
+        return snapshots
 
     async def get_session_state(self, session_id: str) -> dict[str, Any]:
         """Return a snapshot of a live session's state."""

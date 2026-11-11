@@ -104,12 +104,18 @@ class GatewayManager:
         self.active_sessions_per_gateway[gateway_index] -= 1
         return trajectories
 
-    async def abort_session(self, session_id: str) -> None:
-        """Abort a routed session on its owning actor and release the route."""
+    async def abort_session(self, session_id: str):
+        """Release the route and return captured trajectories for diagnostics."""
         gateway, gateway_index = self._get_gateway(session_id)
-        await gateway.abort_session.remote(session_id=session_id)
-        self._session_to_gateway_index.pop(session_id, None)
-        self.active_sessions_per_gateway[gateway_index] -= 1
+        try:
+            return await gateway.abort_session.remote(session_id=session_id)
+        finally:
+            self._session_to_gateway_index.pop(session_id, None)
+            self.active_sessions_per_gateway[gateway_index] -= 1
+
+    async def get_session_state(self, session_id: str) -> dict[str, object]:
+        gateway, _ = self._get_gateway(session_id)
+        return await gateway.get_session_state.remote(session_id=session_id)
 
     async def shutdown(self) -> None:
         """Stop owned gateway actors and clear routing state."""

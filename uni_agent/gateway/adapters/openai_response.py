@@ -311,6 +311,9 @@ def _flatten_tool(
             "parameters": parameters,
         },
     }
+    if tool_type == "custom":
+        declaration["custom"] = {key: value for key, value in source.items() if key != "defer_loading"}
+        declaration["custom"].update(type="custom", name=qualified_name)
     declarations = [] if drop_deferred and tool.get("defer_loading") else [declaration]
     return declarations, {qualified_name: str(tool_type)}, {qualified_name: (namespace, name)}
 
