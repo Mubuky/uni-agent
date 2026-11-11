@@ -327,7 +327,7 @@ async def test_context_boundary_trim_does_not_mark_replacement_context_as_genera
     from tests.uni_agent.gateway.test_session_trajectory_tree_on_cpu import FakeContinuousCodec
 
     codec = MessageCodec(FakeTokenizer())
-    codec._continuous_token_builder = FakeContinuousCodec(trim_boundary=True)
+    codec._continuous_token_builder.merge_context_tokens = FakeContinuousCodec(trim_boundary=True).merge_context_tokens
     session = session_cls(SessionHandle("trim"), codec, sampling_params={"logprobs": True})
     backend = Backend("AB", "C", "D")
     messages = [{"role": "user", "content": "work"}]
