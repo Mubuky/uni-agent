@@ -137,22 +137,38 @@ by remote wheel availability; that runtime combination remains unverified.
 | Gateway/framework, including native HTTP/SSE, Responses, codec, linear/tree contexts and real Ray gateway actors | 717 passed, 9 skipped, 17 deselected |
 | Native verl multi-trajectory GRPO, loss aggregation, Token-TIS, padding and ReplayBuffer with a real TransferQueue 0.1.11 service | 95 passed |
 | MiMo runner, consumer routing, token contract, native-result monitoring and optimizer membership | 36 passed, 1 skipped |
-| Isolated Codex/model rollout and GPU optimizer update | Blocked by native Responses rejection of a compaction request; no optimizer update |
+| Isolated Codex/model rollout with default compaction threshold and four-GPU optimizer update | Passed: 16 consumed rollouts, nonzero gradient and saved parameter change |
+| Forced native Codex compaction | Blocked by upstream Responses rejection of an empty-tool request |
 
 The nine gateway skips require optional `qwen_vl_utils` or `vllm.parser.qwen3`.
 The 17 deselected level1 checks exercise provider tunnels or live worker-ready
 probes. The consumer skip requires an explicitly configured Docker test image.
 A live SGLang deployment is outside this validation scope.
 
-The live Codex 0.154.0 trial reached model generation, then failed when native
+The forced-compaction Codex 0.154.0 trial reached model generation, then failed when native
 compaction sent `tools=[]` with `parallel_tool_calls=false`. The current upstream
 adapter rejects that flag before generation. A minimal empty-tool request
 reproduces the rejection; the earlier MiMo adapter accepted it. Codex constructs
 its [compaction prompt](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/compact.rs#L271)
 using [Prompt defaults](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/core/src/client_common.rs#L37),
 so this is not a mimoagent result-contract issue. The branch currently retains
-upstream's validation. Live compaction, consumed multi-chain trajectories and a
-nonzero optimizer update remain switching requirements.
+upstream's validation. Live compaction and optimizer consumption of compacted multi-chain trajectories
+remain switching requirements.
+
+A separate trial using Codex's default compaction threshold completed one native
+optimizer step on four H200 GPUs. It consumed two groups of eight rollouts with
+rewards 6/8 and 1/8, with no padding. The gradient norm was `0.28590438`;
+202,871,959 elements changed in the native BF16 HF export (L2 delta
+`0.02075249`). The saved optimizer state was 75,281,850,592 bytes. This proves a
+parameter update, not an improvement in task performance.
+
+All 29 completed sessions passed span/mask/logprob checks: 680,195 generated
+tokens and 1,867,213 context tokens. Rollout/training probability correlation was
+`0.99843889`, mean absolute probability difference `0.01030278`, and Token-TIS
+mean weight `0.98054516` with effective sample size `0.99796887`. The optimizer
+consumed 16 of those sessions; three unfinished prefetched sessions remained
+ungraded. All captured completed sessions had one context chain. The test job,
+GPU allocation and sandbox containers were released after artifact collection.
 
 The uneven-context regression gives one successful rollout three contexts and
 seven unsuccessful rollouts one context each. Native GRPO assigns `0.875` to
