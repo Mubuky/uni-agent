@@ -220,3 +220,33 @@ def test_custom_template_view_keeps_raw_input_and_schema():
     codec._freeform_tool_calls = False
     assert codec.model_tools_for(internal["tools"])[0]["function"]["parameters"]["required"] == ["input"]
     assert "custom" in internal["tools"][0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tree", [False, True])
+async def test_http_responses_and_activity_routes_use_native_session(tree):
+    import httpx
+
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    actor = _GatewayActor(
+        GatewayActorConfig(tokenizer=FakeTokenizer(), use_tree_trajectory_manager=tree), Backend("done")
+    )
+    actor._server_base_url = "http://gateway.test"
+    handle = await actor.create_session("http", sampling_params={"logprobs": True})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=actor._app), base_url=actor._server_base_url
+    ) as client:
+        bad = await client.post(handle.base_url + "/responses", json={"input": "go", "max_output_tokens": 0})
+        assert bad.status_code == 400
+        response = await client.post(handle.base_url + "/responses", json={"input": "go", "stream": True})
+        assert response.status_code == 200
+        assert "event: response.created" in response.text
+        assert "event: response.completed" in response.text
+        activity = await client.post(handle.activity_url, json={"agent_finished": True})
+        assert activity.status_code == 200
+        assert (await actor.get_session_state("http"))["agent_finished"] is True
+    trajectories = await actor.finalize_session("http")
+    assert trajectories[0].response_ids == list(map(ord, "done"))
+    assert trajectories[0].response_logprobs == [-0.25] * 4

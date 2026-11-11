@@ -581,7 +581,7 @@ async def test_responses_stream_is_consumed_by_openai_sdk(stream_case):
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.asyncio
-async def test_responses_handler_waits_for_generation_before_returning(stream):
+async def test_responses_handler_starts_stream_before_generation(stream):
     started, release = asyncio.Event(), asyncio.Event()
 
     async def generate(*args):
@@ -592,22 +592,39 @@ async def test_responses_handler_waits_for_generation_before_returning(stream):
     generate_mock = AsyncMock(side_effect=generate)
     actor = _make_actor(sessions={"s1": SimpleNamespace(sampling_params={}, run_generation=generate_mock)})
     task = asyncio.create_task(actor._handle_openai_responses("s1", _request(stream=stream)))
+    consume = None
     try:
+        if stream:
+            response = await task
+            assert not started.is_set()
+            body = response.body_iterator
+            assert b"response.created" in await anext(body)
+            await anext(body)
+            consume = asyncio.create_task(anext(body))
         await asyncio.wait_for(started.wait(), timeout=1)
-        assert not task.done()
+        assert task.done() is stream
     finally:
         release.set()
         await task
+        if consume is not None:
+            await consume
+            await body.aclose()
     generate_mock.assert_awaited_once()
 
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.asyncio
-async def test_responses_generation_errors_precede_stream_headers(stream):
+async def test_responses_generation_errors_use_the_selected_transport(stream):
     generate = AsyncMock(side_effect=RuntimeError("backend unavailable"))
     actor = _make_actor(sessions={"s1": SimpleNamespace(sampling_params={}, run_generation=generate)})
-    with pytest.raises(RuntimeError, match="backend unavailable"):
-        await actor._handle_openai_responses("s1", _request(stream=stream))
+    if stream:
+        response = await actor._handle_openai_responses("s1", _request(stream=True))
+        wire = b"".join([chunk async for chunk in response.body_iterator])
+        assert b"response.failed" in wire and b"backend unavailable" in wire
+        assert b"response.completed" not in wire
+    else:
+        with pytest.raises(RuntimeError, match="backend unavailable"):
+            await actor._handle_openai_responses("s1", _request(stream=False))
     generate.assert_awaited_once()
 
 
