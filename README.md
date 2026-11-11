@@ -115,3 +115,7 @@ If you find the project helpful, please cite:
 ## Contributing 🤝
 
 Community contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get started.
+
+## Maintenance branch
+
+See the [MiMo patch inventory and compatibility results](docs/source/concepts/mimo-maintenance.md) for `mimo-maint`.
